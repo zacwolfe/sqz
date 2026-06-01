@@ -12,6 +12,10 @@ pub mod lint;
 mod gh;
 mod python;
 mod go;
+mod cloud;
+mod jvm;
+#[cfg(test)]
+mod props;
 
 pub fn format_command(cmd: &str, output: &str) -> Option<String> {
     let cleaned = preprocess::clean(output);
@@ -52,9 +56,18 @@ fn dispatch(cmd: &str, output: &str) -> Option<String> {
         "go" => go::format_go(parts.get(1).copied(), output),
         "golangci-lint" => Some(lint::format_lint(output)),
 
-        // Containers
+        // JVM
+        "gradle" | "gradlew" | "./gradlew" => jvm::format_gradle(parts.get(1).copied(), output),
+        "mvn" | "maven" => jvm::format_maven(parts.get(1).copied(), output),
+
+        // Containers / orchestration
         "docker" | "podman" => docker::format_docker(parts.get(1).copied(), output),
         "kubectl" => kubectl::format_kubectl(parts.get(1).copied(), output),
+
+        // Cloud CLIs
+        "aws" => cloud::format_aws(parts.get(1).copied(), output),
+        "terraform" | "tf" => cloud::format_terraform(parts.get(1).copied(), output),
+        "gcloud" => cloud::format_gcloud(output),
 
         // System utilities
         "ls" => Some(system::format_ls(output)),
@@ -93,5 +106,14 @@ mod tests {
         assert!(format_command("grep foo bar.txt", "bar.txt:1:foo").is_some());
         assert!(format_command("tree", ".\n├── src\n└── Cargo.toml").is_some());
         assert!(format_command("curl http://example.com", "response").is_some());
+    }
+
+    #[test]
+    fn test_phase4_commands_dispatch() {
+        assert!(format_command("aws s3 ls", "2024-01-01 bucket/file.txt").is_some());
+        assert!(format_command("terraform plan", "No changes. Infrastructure is up-to-date.").is_some());
+        assert!(format_command("gradle build", "BUILD SUCCESSFUL in 3s").is_some());
+        assert!(format_command("mvn compile", "[INFO] BUILD SUCCESS").is_some());
+        assert!(format_command("kubectl describe pod nginx", "Name: nginx").is_some());
     }
 }
