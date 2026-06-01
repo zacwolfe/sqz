@@ -9,6 +9,9 @@ mod kubectl;
 mod system;
 mod js;
 pub mod lint;
+mod gh;
+mod python;
+mod go;
 
 pub fn format_command(cmd: &str, output: &str) -> Option<String> {
     let cleaned = preprocess::clean(output);
@@ -22,19 +25,44 @@ fn dispatch(cmd: &str, output: &str) -> Option<String> {
     let base = parts.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("");
 
     match base {
+        // Version control
         "git" => git::format_git(parts.get(1).copied(), output),
+        "gh" => gh::format_gh(parts.get(1).copied(), output),
+
+        // Rust
         "cargo" => cargo::format_cargo(parts.get(1).copied(), output),
+
+        // JavaScript/TypeScript
         "npm" | "npx" => npm::format_npm(parts.get(1).copied(), output),
         "pnpm" => npm::format_pnpm(parts.get(1).copied(), output),
         "yarn" | "bun" => npm::format_npm(parts.get(1).copied(), output),
-        "pytest" | "python" if cmd.contains("pytest") => Some(test_output::format_test_failures(output)),
-        "go" if parts.get(1).copied() == Some("test") => Some(test_output::format_test_failures(output)),
-        "docker" | "podman" => docker::format_docker(parts.get(1).copied(), output),
-        "kubectl" => kubectl::format_kubectl(parts.get(1).copied(), output),
-        "ls" => Some(system::format_ls(output)),
-        "find" | "fd" => Some(system::format_find(output)),
         "tsc" => Some(js::format_tsc(output)),
         "eslint" | "biome" => Some(lint::format_lint(output)),
+
+        // Python
+        "pytest" => Some(test_output::format_test_failures(output)),
+        "python" | "python3" if cmd.contains("pytest") || cmd.contains("-m pytest") => {
+            Some(test_output::format_test_failures(output))
+        }
+        "ruff" => python::format_python(cmd, parts.get(1).copied(), output),
+        "mypy" => python::format_python(cmd, None, output),
+        "pip" | "pip3" => python::format_python(cmd, parts.get(1).copied(), output),
+
+        // Go
+        "go" => go::format_go(parts.get(1).copied(), output),
+        "golangci-lint" => Some(lint::format_lint(output)),
+
+        // Containers
+        "docker" | "podman" => docker::format_docker(parts.get(1).copied(), output),
+        "kubectl" => kubectl::format_kubectl(parts.get(1).copied(), output),
+
+        // System utilities
+        "ls" => Some(system::format_ls(output)),
+        "find" | "fd" => Some(system::format_find(output)),
+        "grep" | "rg" | "ag" => Some(system::format_grep(output)),
+        "tree" => Some(system::format_tree(output)),
+        "curl" | "wget" => Some(system::format_curl(output)),
+
         _ => None,
     }
 }
@@ -55,5 +83,15 @@ mod tests {
         let output = "\x1b[32mOn branch main\x1b[0m\nnothing to commit, working tree clean\n";
         let result = format_command("git status", output);
         assert_eq!(result, Some("clean".to_string()));
+    }
+
+    #[test]
+    fn test_new_commands_dispatch() {
+        assert!(format_command("gh pr list", "[]").is_some());
+        assert!(format_command("ruff check", "All checks passed!").is_some());
+        assert!(format_command("go test ./...", "ok").is_some());
+        assert!(format_command("grep foo bar.txt", "bar.txt:1:foo").is_some());
+        assert!(format_command("tree", ".\n├── src\n└── Cargo.toml").is_some());
+        assert!(format_command("curl http://example.com", "response").is_some());
     }
 }
