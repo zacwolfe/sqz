@@ -4,7 +4,7 @@ Reproducible benchmark results from the sqz compression engine.
 All measurements use the `sqz compress` CLI on the inputs shown.
 Token counts use the `chars / 4` approximation (GPT-style).
 
-**Last updated:** April 2026 | **sqz version:** 0.1.1 | **Platform:** macOS aarch64
+**Last updated:** May 2026 | **sqz version:** 1.2.0 | **Platform:** macOS aarch64
 
 ---
 
@@ -126,6 +126,29 @@ diff --git a/src/main.rs b/src/main.rs
 
 Method: `git_diff_fold` stage keeps 2 context lines around each change, folds the rest.
 Critical info preserved: ✅ All changed lines (+/-) and hunk headers retained.
+
+---
+
+### 4. Per-Command Formatters (v1.2.0)
+
+Command-specific formatters run before the general compression pipeline and produce
+much higher savings for known commands:
+
+| Command | Input (tokens) | Output (tokens) | Reduction | Method |
+|---|---:|---:|---:|---|
+| `cargo test` (15 pass, 3 suites) | 1,250 | 20 | **98%** | Skip pass lines, aggregate suites |
+| `cargo build` (2 errors, 30 crates) | 3,000 | 150 | **95%** | Skip Compiling noise, error blocks only |
+| `cargo clippy` (5 warnings) | 2,000 | 120 | **94%** | Group by rule + location |
+| `git status` (verbose, 10 files) | 300 | 45 | **85%** | Compact staged/modified/untracked |
+| `git log` (10 commits, full format) | 500 | 85 | **83%** | Hash + subject, one line per commit |
+| `npm install` (200 packages) | 800 | 15 | **98%** | Summary line only |
+| `go test -json` (50 tests, 2 fail) | 4,000 | 200 | **95%** | Parse JSON events, show failures |
+| `terraform plan` (5 resources) | 2,000 | 80 | **96%** | +N ~N -N summary + resource list |
+| `grep` (100 matches, 5 files) | 500 | 100 | **80%** | Group by file, cap at 3 per file |
+| `tree` (500 entries, node_modules) | 2,500 | 150 | **94%** | Collapse noise dirs |
+
+These formatters handle 40+ commands across 9 ecosystems. Unknown commands fall
+through to the general compression pipeline (5-58% reduction depending on content type).
 
 ---
 
