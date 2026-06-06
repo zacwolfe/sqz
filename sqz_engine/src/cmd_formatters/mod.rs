@@ -14,6 +14,7 @@ mod python;
 mod go;
 mod cloud;
 mod jvm;
+mod ruby;
 #[cfg(test)]
 mod props;
 
@@ -25,7 +26,16 @@ pub fn format_command(cmd: &str, output: &str) -> Option<String> {
 }
 
 fn dispatch(cmd: &str, output: &str) -> Option<String> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let mut parts: Vec<&str> = cmd.split_whitespace().collect();
+
+    // `bundle exec rspec ...` / `bin/rails ...` — unwrap the bundler prefix so
+    // the real Ruby tool is dispatched. `bundle install/update` is left intact.
+    if parts.first().map(|s| s.rsplit('/').next().unwrap_or(s)) == Some("bundle")
+        && parts.get(1) == Some(&"exec")
+    {
+        parts.drain(0..2);
+    }
+
     let base = parts.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("");
 
     match base {
@@ -59,6 +69,12 @@ fn dispatch(cmd: &str, output: &str) -> Option<String> {
         // JVM
         "gradle" | "gradlew" | "./gradlew" => jvm::format_gradle(parts.get(1).copied(), output),
         "mvn" | "maven" => jvm::format_maven(parts.get(1).copied(), output),
+
+        // Ruby
+        "rspec" => Some(ruby::format_rspec(output)),
+        "rubocop" => Some(ruby::format_rubocop(output)),
+        "rake" | "rails" => ruby::format_rake(parts.get(1).copied(), output),
+        "bundle" | "bundler" => ruby::format_bundle(parts.get(1).copied(), output),
 
         // Containers / orchestration
         "docker" | "podman" => docker::format_docker(parts.get(1).copied(), output),
@@ -115,5 +131,27 @@ mod tests {
         assert!(format_command("gradle build", "BUILD SUCCESSFUL in 3s").is_some());
         assert!(format_command("mvn compile", "[INFO] BUILD SUCCESS").is_some());
         assert!(format_command("kubectl describe pod nginx", "Name: nginx").is_some());
+    }
+
+    #[test]
+    fn test_ruby_commands_dispatch() {
+        assert!(format_command("rspec", "1 example, 0 failures").is_some());
+        assert!(
+            format_command("rubocop", "10 files inspected, no offenses detected").is_some()
+        );
+        assert!(format_command(
+            "rake test",
+            "8 runs, 9 assertions, 0 failures, 0 errors, 0 skips"
+        )
+        .is_some());
+        assert!(format_command(
+            "bundle install",
+            "Bundle complete! 85 dependencies"
+        )
+        .is_some());
+        // `bundle exec` prefix unwraps to the real tool.
+        assert!(format_command("bundle exec rspec", "1 example, 0 failures").is_some());
+        // Non-test rake tasks fall through to generic compression.
+        assert!(format_command("rake db:migrate", "== migrating ==").is_none());
     }
 }
