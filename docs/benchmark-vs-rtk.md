@@ -34,10 +34,10 @@ Run `cargo test` (15 tests across 3 suites, 2 failing), fix the code, run `cargo
 
 | Step | Raw | rtk | sqz |
 |---|---:|---:|---:|
-| cargo test (2 failures) | 5,000 | 500 | 480 |
-| cargo test (all pass) | 5,000 | 500 | 350 |
-| **Total** | **10,000** | **1,000** | **830** |
-| **Savings vs raw** | — | 90% | **92%** |
+| cargo test (2 failures) | 5,000 | 500 | 500 |
+| cargo test (all pass) | 5,000 | 500 | 375 |
+| **Total** | **10,000** | **1,000** | **875** |
+| **Savings vs raw** | — | 90% | **91%** |
 
 Near-parity. Both tools skip passing tests and Compiling/Downloading noise, showing only failures with context. sqz's multi-suite aggregation produces a more compact success summary ("cargo test: 15 passed (3 suites)") and its block-based failure parser groups error context tightly.
 
@@ -77,13 +77,13 @@ sqz wins on first read (strip_nulls + TOON encoding vs rtk's field filtering) an
 
 | Step | Raw | rtk | sqz |
 |---|---:|---:|---:|
-| cargo build (3 errors) | 3,000 | 600 | 420 |
+| cargo build (3 errors) | 3,000 | 600 | 450 |
 | Read file1.rs | 2,000 | 800 | 800 |
 | Read file2.rs | 1,500 | 600 | 600 |
-| cargo build (success) | 500 | 50 | 25 (→ "ok (2 crates)") |
+| cargo build (success) | 500 | 50 | 30 (→ "ok (N crates compiled)") |
 | Read file1.rs (verify, after fix) | 2,000 | 800 | 70 (delta) |
-| **Total** | **9,000** | **2,850** | **1,915** |
-| **Savings vs raw** | — | 68% | **79%** |
+| **Total** | **9,000** | **2,850** | **1,950** |
+| **Savings vs raw** | — | 68% | **78%** |
 
 sqz's block-based build parser now matches rtk's quality: it skips all Compiling/Downloading/Finished noise, groups errors with source context (up to 15 lines per error block), and produces a summary header ("cargo build: 3 errors, 0 warnings (12 crates)"). The gap comes from delta encoding on the verification re-read and the more compact success message.
 
@@ -97,14 +97,14 @@ Aggregate of all scenarios above, plus 10 additional `ls` calls, 5 `grep` calls,
 | Category | Raw | rtk | sqz |
 |---|---:|---:|---:|
 | File reads (with repeats) | 7,500 | 3,000 | 948 |
-| Test cycles | 10,000 | 1,000 | 830 |
+| Test cycles | 10,000 | 1,000 | 875 |
 | Git workflow | 2,400 | 490 | 433 |
 | JSON API (with repeats) | 8,000 | 3,200 | 1,213 |
-| Build errors + fix | 9,000 | 2,850 | 1,915 |
-| ls/grep/docker (misc) | 5,000 | 1,200 | 950 |
-| **Session total** | **41,900** | **11,740** | **6,289** |
+| Build errors + fix | 9,000 | 2,850 | 1,950 |
+| ls/grep/docker (misc) | 5,000 | 1,200 | 1,050 |
+| **Session total** | **41,900** | **11,740** | **6,469** |
 | **Savings vs raw** | — | **72%** | **85%** |
-| **Savings vs rtk** | — | — | **46%** |
+| **Savings vs rtk** | — | — | **45%** |
 
 ## Where rtk Wins
 

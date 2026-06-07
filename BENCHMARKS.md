@@ -132,23 +132,28 @@ Critical info preserved: ✅ All changed lines (+/-) and hunk headers retained.
 ### 4. Per-Command Formatters (v1.2.0)
 
 Command-specific formatters run before the general compression pipeline and produce
-much higher savings for known commands:
+high savings for known commands. Every number below is measured by a fixture test
+in `sqz_engine/src/cmd_formatter_bench.rs`; the test inputs are the fixtures behind
+these figures, and each row is gated so the numbers can't silently drift:
 
 | Command | Input (tokens) | Output (tokens) | Reduction | Method |
 |---|---:|---:|---:|---|
-| `cargo test` (15 pass, 3 suites) | 1,250 | 20 | **98%** | Skip pass lines, aggregate suites |
-| `cargo build` (2 errors, 30 crates) | 3,000 | 150 | **95%** | Skip Compiling noise, error blocks only |
-| `cargo clippy` (5 warnings) | 2,000 | 120 | **94%** | Group by rule + location |
-| `git status` (verbose, 10 files) | 300 | 45 | **85%** | Compact staged/modified/untracked |
-| `git log` (10 commits, full format) | 500 | 85 | **83%** | Hash + subject, one line per commit |
-| `npm install` (200 packages) | 800 | 15 | **98%** | Summary line only |
-| `go test -json` (50 tests, 2 fail) | 4,000 | 200 | **95%** | Parse JSON events, show failures |
-| `terraform plan` (5 resources) | 2,000 | 80 | **96%** | +N ~N -N summary + resource list |
-| `grep` (100 matches, 5 files) | 500 | 100 | **80%** | Group by file, cap at 3 per file |
-| `tree` (500 entries, node_modules) | 2,500 | 150 | **94%** | Collapse noise dirs |
+| `npm install` (200 packages) | 1,186 | 13 | **99%** | Summary line only |
+| `cargo test` (15 pass, 3 suites) | 171 | 8 | **95%** | Skip pass lines, aggregate suites |
+| `cargo build` (success, 30 crates) | 233 | 23 | **90%** | Skip Compiling noise, status line |
+| `grep` (100 matches, 5 files) | 1,373 | 238 | **83%** | Group by file, cap per file |
+| `terraform plan` (2 resources) | 121 | 25 | **79%** | +N ~N -N summary + resource list |
+| `cargo clippy` (5 warnings) | 163 | 70 | **57%** | Group by rule + location |
+| `git status` (verbose, 10 files) | 102 | 52 | **49%** | Compact staged/modified/untracked |
 
-These formatters handle 40+ commands across 9 ecosystems. Unknown commands fall
-through to the general compression pipeline (5-58% reduction depending on content type).
+Reductions scale with input size: the savings are largest on the verbose, repetitive
+output (package lists, passing-test runs, large match sets) and smaller on output that
+is already compact (a short `git status`, a handful of clippy warnings with source
+context). These formatters handle 40+ commands across 9 ecosystems. Unknown commands
+fall through to the general compression pipeline (5-58% reduction depending on content
+type).
+
+Reproduce: `cargo test -p sqz-engine cmd_formatter_bench -- --nocapture`
 
 ---
 
