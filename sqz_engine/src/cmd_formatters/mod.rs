@@ -1,6 +1,6 @@
 mod preprocess;
-pub mod truncate;
-pub mod test_output;
+mod truncate;
+mod test_output;
 mod git;
 mod cargo;
 mod npm;
@@ -8,7 +8,7 @@ mod docker;
 mod kubectl;
 mod system;
 mod js;
-pub mod lint;
+mod lint;
 mod gh;
 mod python;
 mod go;
