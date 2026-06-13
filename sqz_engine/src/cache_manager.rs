@@ -1076,6 +1076,7 @@ mod tests {
                     summary_template: "... and {remaining} more items".into(),
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
+                json_projection: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
