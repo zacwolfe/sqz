@@ -270,6 +270,7 @@ impl SqzEngine {
                 truncate_strings: None,
                 collapse_arrays: None,
                 custom_transforms: Some(CustomTransformsConfig { enabled: false }),
+                json_projection: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,

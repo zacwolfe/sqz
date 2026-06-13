@@ -24,8 +24,14 @@ pub struct ProjectionConfig {
     /// Remove fields matching these exact names (case-insensitive).
     pub strip_names: Vec<String>,
     /// Maximum nesting depth to preserve. Objects deeper than this
-    /// are replaced with `{...N keys}`. Default: 5.
+    /// are replaced with `{...N keys}` — but only when `summarize_deep`
+    /// is true. Default: 8.
     pub max_depth: usize,
+    /// Replace objects deeper than `max_depth` with a lossy
+    /// `{...N keys}` summary. This DELETES the real subtree, so it is
+    /// off by default — deeply nested API payloads (e.g. cohort
+    /// definitions) lose their actual values otherwise. Default: false.
+    pub summarize_deep: bool,
     /// Remove empty arrays and objects. Default: true.
     pub strip_empty: bool,
     /// Remove redundant timestamps (keep only the most recent). Default: true.
@@ -53,10 +59,34 @@ impl Default for ProjectionConfig {
                 "x_request_id".to_string(),
                 "correlation_id".to_string(),
             ],
-            max_depth: 5,
+            max_depth: 8,
+            summarize_deep: false,
             strip_empty: true,
             dedup_timestamps: true,
         }
+    }
+}
+
+impl ProjectionConfig {
+    /// Apply environment-variable overrides, mirroring the `SQZ_NO_DEDUP`
+    /// escape-hatch pattern. End users tune projection without touching
+    /// any config file:
+    ///
+    /// - `SQZ_JSON_SUMMARIZE_DEEP=1` — opt back into the lossy
+    ///   `{...N keys}` truncation of deeply nested objects (off by default).
+    /// - `SQZ_JSON_MAX_DEPTH=12` — depth at which that truncation kicks in.
+    ///
+    /// Unset or unparseable vars leave the field untouched.
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(v) = std::env::var("SQZ_JSON_SUMMARIZE_DEEP") {
+            self.summarize_deep = matches!(v.trim(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SQZ_JSON_MAX_DEPTH") {
+            if let Ok(d) = v.trim().parse::<usize>() {
+                self.max_depth = d;
+            }
+        }
+        self
     }
 }
 
@@ -124,8 +154,10 @@ fn project_value(
 ) {
     match value {
         serde_json::Value::Object(map) => {
-            // At max depth, replace deep objects with a summary
-            if depth >= config.max_depth {
+            // At max depth, replace deep objects with a summary. Lossy —
+            // gated behind `summarize_deep` so structured payloads keep
+            // their real values by default.
+            if config.summarize_deep && depth >= config.max_depth {
                 let key_count = map.len();
                 if key_count > 0 {
                     map.clear();
@@ -329,6 +361,7 @@ mod tests {
         });
         let config = ProjectionConfig {
             max_depth: 3,
+            summarize_deep: true,
             ..Default::default()
         };
         let result = project_json(&serde_json::to_string(&input).unwrap(), &config).unwrap();
@@ -340,6 +373,45 @@ mod tests {
             at_depth.get("_sqz_summary").is_some() || result.fields_removed > 0,
             "deep nesting should be truncated at max_depth: {:?}", parsed
         );
+    }
+
+    #[test]
+    fn test_deep_values_preserved_by_default() {
+        // Regression: anypipe cohort definitions nest deeper than the old
+        // max_depth=5 and were being replaced with `{...N keys}`, deleting
+        // the real resolver values. Default config must keep them.
+        let input = json!({
+            "definition": {
+                "params": [
+                    {"resolver": "GiftCard", "params": {
+                        "credit_type": {"combinator": "OR", "values": [
+                            {"resolver": "Now", "params": {"credit": "PROMO_X"}}
+                        ]}
+                    }}
+                ],
+                "resolver": "AND"
+            }
+        });
+        let config = ProjectionConfig::default();
+        let result = project_json(&serde_json::to_string(&input).unwrap(), &config).unwrap();
+        // The leaf value must survive — no lossy summary token.
+        assert!(!result.data.contains("_sqz_summary"), "deep subtree was summarized away: {}", result.data);
+        assert!(result.data.contains("PROMO_X"), "leaf value lost: {}", result.data);
+    }
+
+    #[test]
+    fn test_env_override_parsing() {
+        // Drive the parsing logic directly rather than touching process env
+        // (which would race other tests). Mirror with_env_overrides' rules.
+        let parse_bool = |v: &str| matches!(v.trim(), "1" | "true" | "yes" | "on");
+        assert!(parse_bool("1"));
+        assert!(parse_bool(" true "));
+        assert!(parse_bool("on"));
+        assert!(!parse_bool("0"));
+        assert!(!parse_bool("false"));
+        assert!(!parse_bool(""));
+        assert_eq!("12".trim().parse::<usize>().ok(), Some(12));
+        assert_eq!("garbage".trim().parse::<usize>().ok(), None);
     }
 
     #[test]

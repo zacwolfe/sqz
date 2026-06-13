@@ -109,8 +109,22 @@ impl CompressionPipeline {
 
         // JSON projection: strip internal/debug fields, empty collections,
         // deep nesting, and redundant timestamps before other JSON processing
-        if is_json && content.raw.len() > 100 {
-            let proj_config = crate::json_projection::ProjectionConfig::default();
+        let projection_enabled = preset
+            .compression
+            .json_projection
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(true);
+        if is_json && content.raw.len() > 100 && projection_enabled {
+            let proj_config = match &preset.compression.json_projection {
+                Some(c) => crate::json_projection::ProjectionConfig {
+                    summarize_deep: c.summarize_deep,
+                    max_depth: c.max_depth as usize,
+                    ..Default::default()
+                },
+                None => crate::json_projection::ProjectionConfig::default(),
+            }
+            .with_env_overrides();
             if let Ok(proj_result) = crate::json_projection::project_json(&content.raw, &proj_config) {
                 if proj_result.fields_removed > 0 {
                     content.raw = proj_result.data;
@@ -460,6 +474,7 @@ mod tests {
                     summary_template: "... and {remaining} more items".into(),
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
+                json_projection: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,

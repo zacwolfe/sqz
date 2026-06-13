@@ -162,6 +162,25 @@ pub struct CompressionConfig {
     pub truncate_strings: Option<TruncateStringsConfig>,
     pub collapse_arrays: Option<CollapseArraysConfig>,
     pub custom_transforms: Option<CustomTransformsConfig>,
+    pub json_projection: Option<JsonProjectionConfig>,
+}
+
+/// Controls schema-aware JSON projection (strip low-value fields,
+/// optionally summarize deeply nested objects).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonProjectionConfig {
+    pub enabled: bool,
+    /// Replace objects nested deeper than `max_depth` with a lossy
+    /// `{...N keys}` summary. DELETES the real subtree — off by default
+    /// so structured API payloads keep their values.
+    #[serde(default)]
+    pub summarize_deep: bool,
+    #[serde(default = "default_projection_max_depth")]
+    pub max_depth: u32,
+}
+
+fn default_projection_max_depth() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +418,11 @@ impl Default for Preset {
                     summary_template: "... and {remaining} more items".to_string(),
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
+                json_projection: Some(JsonProjectionConfig {
+                    enabled: true,
+                    summarize_deep: false,
+                    max_depth: 8,
+                }),
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
@@ -535,6 +559,7 @@ mod tests {
                     truncate_strings: None,
                     collapse_arrays: None,
                     custom_transforms: None,
+                    json_projection: None,
                 },
                 tool_selection,
                 budget,
