@@ -10,6 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::io::IsTerminal;
 use std::path::Path;
 use sqz_engine::{format_command, CompressedContent, DependencyMapper, NgramAbbreviator, SqzEngine};
 
@@ -149,11 +150,27 @@ impl InterceptOptions {
     }
 }
 
-/// Suppress informational stderr lines when `SQZ_QUIET=1`.
+/// Suppress informational stderr lines when `SQZ_QUIET` says so, or when
+/// stderr is not a terminal (the agent/hook case, where banners only add
+/// context tokens). `SQZ_QUIET=0` forces banners on for interactive debugging.
 /// Checked per print site rather than cached: replay flips the env var
 /// at runtime, and these paths are nowhere near hot enough to care.
 fn quiet() -> bool {
-    sqz_engine::SqzEngine::quiet_stderr()
+    quiet_decision(
+        std::env::var("SQZ_QUIET").ok().as_deref(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+/// Pure decision for [`quiet`], split out for testing. `env` is the raw
+/// `SQZ_QUIET` value (if set); `stderr_is_tty` whether stderr is an
+/// interactive terminal.
+fn quiet_decision(env: Option<&str>, stderr_is_tty: bool) -> bool {
+    match env.map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => !stderr_is_tty,
+    }
 }
 
 /// Run `f`, or return where it panicked, without printing the panic message.
@@ -508,10 +525,19 @@ impl CliProxy {
     }
 
     /// Log compression stats to stderr.
+    ///
+    /// The banner goes to stderr, which Claude Code's Bash tool captures into
+    /// the tool result — so it costs context tokens on every hooked command.
+    /// Suppress it when it isn't earning its keep:
+    /// - `SQZ_QUIET=1` (or `true`/`yes`/`on`) silences it entirely.
+    /// - A 0% reduction means the banner is pure overhead (it added tokens
+    ///   while compression saved none), so skip it.
+    ///
+    /// The session-DB stats logging below always runs, regardless.
     fn log_compression(&self, cmd: &str, original: u32, compressed: u32) {
         let saved = original.saturating_sub(compressed);
         let pct = if original > 0 { (saved as f64 / original as f64 * 100.0) as u32 } else { 0 };
-        if !quiet() {
+        if !quiet() && pct > 0 {
             eprintln!("[sqz] {}/{} tokens ({}% reduction) [{}]", compressed, original, pct, cmd);
         }
         let project = std::env::current_dir().ok();
@@ -751,6 +777,24 @@ impl CliProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quiet_decision() {
+        // Explicit opt-out wins regardless of tty.
+        assert!(quiet_decision(Some("1"), true));
+        assert!(quiet_decision(Some(" true "), true));
+        assert!(quiet_decision(Some("on"), false));
+        // Explicit opt-in wins regardless of tty (force banner under hook).
+        assert!(!quiet_decision(Some("0"), false));
+        assert!(!quiet_decision(Some("false"), false));
+        // Unset: follow the terminal. Non-tty (agent/hook) → quiet;
+        // interactive terminal → show.
+        assert!(quiet_decision(None, false));
+        assert!(!quiet_decision(None, true));
+        // Unrecognized value falls through to the tty heuristic.
+        assert!(quiet_decision(Some("maybe"), false));
+        assert!(!quiet_decision(Some("maybe"), true));
+    }
 
     #[test]
     fn test_is_known_command_git() {
