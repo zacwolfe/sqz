@@ -10,6 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::io::IsTerminal;
 use std::path::Path;
 use sqz_engine::{format_command, CompressedContent, DependencyMapper, NgramAbbreviator, SqzEngine};
 
@@ -229,7 +230,9 @@ impl CliProxy {
         if !opts.no_cache && self.l1_cache.borrow().contains(&fast_hash) {
             // L1 hit — check L2 persistent cache for the actual ref
             if let Ok(Some(inline_ref)) = self.engine.cache_manager().check_dedup(output.as_bytes()) {
-                eprintln!("[sqz] dedup hit: {} (L1+L2)", inline_ref);
+                if !Self::quiet() {
+                    eprintln!("[sqz] dedup hit: {} (L1+L2)", inline_ref);
+                }
                 self.log_dedup_hit(cmd, output);
                 return inline_ref;
             }
@@ -240,7 +243,9 @@ impl CliProxy {
             if let Ok(Some(inline_ref)) = self.engine.cache_manager().check_dedup(output.as_bytes()) {
                 // Promote to L1 for faster future lookups
                 self.l1_cache.borrow_mut().insert(fast_hash);
-                eprintln!("[sqz] dedup hit: {} (L2)", inline_ref);
+                if !Self::quiet() {
+                    eprintln!("[sqz] dedup hit: {} (L2)", inline_ref);
+                }
                 self.log_dedup_hit(cmd, output);
                 return inline_ref;
             }
@@ -305,7 +310,9 @@ impl CliProxy {
                 abbr.observe(&compressed.data);
                 let abbreviated = match abbr.abbreviate(&compressed.data) {
                     Ok(result) if result.total_tokens_saved > 0 => {
-                        eprintln!("[sqz] n-gram abbreviation: {} tokens saved", result.total_tokens_saved);
+                        if !Self::quiet() {
+                            eprintln!("[sqz] n-gram abbreviation: {} tokens saved", result.total_tokens_saved);
+                        }
                         result.text
                     }
                     _ => compressed.data,
@@ -320,11 +327,53 @@ impl CliProxy {
         }
     }
 
+    /// Whether to suppress informational stderr banners.
+    ///
+    /// The banners exist for a human watching an interactive terminal.
+    /// Under the Claude Code / shell hook, sqz's stderr is captured into
+    /// the Bash tool result instead — so every banner costs context
+    /// tokens. Two triggers suppress them:
+    /// - `SQZ_QUIET=1` (or `true`/`yes`/`on`) — explicit opt-out.
+    /// - `SQZ_QUIET=0` (or `false`/`no`/`off`) — explicit opt-IN, even
+    ///   when stderr is not a terminal.
+    /// - Otherwise: auto-suppress whenever stderr is not a terminal,
+    ///   which is exactly the agent/hook case.
+    ///
+    /// Error/fallback messages are never gated by this.
+    fn quiet() -> bool {
+        Self::quiet_decision(
+            std::env::var("SQZ_QUIET").ok().as_deref(),
+            std::io::stderr().is_terminal(),
+        )
+    }
+
+    /// Pure decision for [`quiet`], split out for testing. `env` is the
+    /// raw `SQZ_QUIET` value (if set); `stderr_is_tty` whether stderr is
+    /// an interactive terminal.
+    fn quiet_decision(env: Option<&str>, stderr_is_tty: bool) -> bool {
+        match env.map(str::trim) {
+            Some("1" | "true" | "yes" | "on") => true,
+            Some("0" | "false" | "no" | "off") => false,
+            _ => !stderr_is_tty,
+        }
+    }
+
     /// Log compression stats to stderr.
+    ///
+    /// The banner goes to stderr, which Claude Code's Bash tool captures into
+    /// the tool result — so it costs context tokens on every hooked command.
+    /// Suppress it when it isn't earning its keep:
+    /// - `SQZ_QUIET=1` (or `true`/`yes`/`on`) silences it entirely.
+    /// - A 0% reduction means the banner is pure overhead (it added tokens
+    ///   while compression saved none), so skip it.
+    ///
+    /// The session-DB stats logging below always runs, regardless.
     fn log_compression(&self, cmd: &str, original: u32, compressed: u32) {
         let saved = original.saturating_sub(compressed);
         let pct = if original > 0 { (saved as f64 / original as f64 * 100.0) as u32 } else { 0 };
-        eprintln!("[sqz] {}/{} tokens ({}% reduction) [{}]", compressed, original, pct, cmd);
+        if !Self::quiet() && pct > 0 {
+            eprintln!("[sqz] {}/{} tokens ({}% reduction) [{}]", compressed, original, pct, cmd);
+        }
         let project = std::env::current_dir().ok();
         let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
         let _ = self.engine.session_store().log_compression_with_project(
@@ -378,7 +427,9 @@ impl CliProxy {
         // >80k tokens in 30min = high pressure → aggressive mode
         // >120k tokens in 30min = critical → aggressive mode
         if pressure > 80_000 {
-            eprintln!("[sqz] adaptive: high session pressure ({} tokens/30min), escalating compression", pressure);
+            if !Self::quiet() {
+                eprintln!("[sqz] adaptive: high session pressure ({} tokens/30min), escalating compression", pressure);
+            }
             self.engine.compress_with_mode(output, sqz_engine::CompressionMode::Aggressive)
         } else {
             self.engine.compress(output)
@@ -493,7 +544,7 @@ impl CliProxy {
             }
         }
 
-        if precached > 0 {
+        if precached > 0 && !Self::quiet() {
             eprintln!("[sqz] predictive pre-cache: {} dependencies of {} cached",
                 precached, file_path);
         }
@@ -540,6 +591,24 @@ impl CliProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quiet_decision() {
+        // Explicit opt-out wins regardless of tty.
+        assert!(CliProxy::quiet_decision(Some("1"), true));
+        assert!(CliProxy::quiet_decision(Some(" true "), true));
+        assert!(CliProxy::quiet_decision(Some("on"), false));
+        // Explicit opt-in wins regardless of tty (force banner under hook).
+        assert!(!CliProxy::quiet_decision(Some("0"), false));
+        assert!(!CliProxy::quiet_decision(Some("false"), false));
+        // Unset: follow the terminal. Non-tty (agent/hook) → quiet;
+        // interactive terminal → show.
+        assert!(CliProxy::quiet_decision(None, false));
+        assert!(!CliProxy::quiet_decision(None, true));
+        // Unrecognized value falls through to the tty heuristic.
+        assert!(CliProxy::quiet_decision(Some("maybe"), false));
+        assert!(!CliProxy::quiet_decision(Some("maybe"), true));
+    }
 
     #[test]
     fn test_is_known_command_git() {
