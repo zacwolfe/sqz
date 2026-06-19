@@ -18,7 +18,17 @@ fn is_noise_line(line: &str) -> bool {
         || trimmed.starts_with("Fetching")
 }
 
-fn format_cargo_build(output: &str) -> String {
+/// What `collect_build_blocks` scraped from a `cargo build` run.
+struct BuildBlocks {
+    compiled: usize,
+    warning_count: usize,
+    finished_line: Option<String>,
+    error_blocks: Vec<Vec<String>>,
+}
+
+/// Walk the build output once: count compiled crates, gather each error/warning
+/// diagnostic into its own block, and capture the trailing "Finished" line.
+fn collect_build_blocks(output: &str) -> BuildBlocks {
     let mut compiled = 0;
     let mut error_blocks: Vec<Vec<String>> = Vec::new();
     let mut warning_count = 0;
@@ -70,13 +80,26 @@ fn format_cargo_build(output: &str) -> String {
         error_blocks.push(current_block);
     }
 
-    let error_count = error_blocks.iter().filter(|b| {
-        b.first().map(|l| l.starts_with("error")).unwrap_or(false)
-    }).count();
+    BuildBlocks {
+        compiled,
+        warning_count,
+        finished_line,
+        error_blocks,
+    }
+}
 
-    if error_count == 0 && warning_count == 0 {
-        let mut s = format!("ok ({} crates compiled)", compiled);
-        if let Some(ref finished) = finished_line {
+fn format_cargo_build(output: &str) -> String {
+    let blocks = collect_build_blocks(output);
+
+    let error_count = blocks
+        .error_blocks
+        .iter()
+        .filter(|b| b.first().map(|l| l.starts_with("error")).unwrap_or(false))
+        .count();
+
+    if error_count == 0 && blocks.warning_count == 0 {
+        let mut s = format!("ok ({} crates compiled)", blocks.compiled);
+        if let Some(ref finished) = blocks.finished_line {
             s = format!("{}\n{}", s, finished);
         }
         return s;
@@ -84,14 +107,17 @@ fn format_cargo_build(output: &str) -> String {
 
     let mut result = format!(
         "cargo build: {} errors, {} warnings ({} crates)\n",
-        error_count, warning_count, compiled
+        error_count, blocks.warning_count, blocks.compiled
     );
-    for blk in error_blocks.iter().take(CAP_ERRORS) {
+    for blk in blocks.error_blocks.iter().take(CAP_ERRORS) {
         result.push_str(&blk.join("\n"));
         result.push('\n');
     }
-    if error_blocks.len() > CAP_ERRORS {
-        result.push_str(&format!("...+{} more issues\n", error_blocks.len() - CAP_ERRORS));
+    if blocks.error_blocks.len() > CAP_ERRORS {
+        result.push_str(&format!(
+            "...+{} more issues\n",
+            blocks.error_blocks.len() - CAP_ERRORS
+        ));
     }
     result.trim().to_string()
 }
