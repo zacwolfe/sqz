@@ -196,6 +196,21 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
         });
     }
 
+    // Coverage visibility (issue: no data existed on what fraction of real
+    // Bash calls actually get intercepted vs. silently skipped). Off by
+    // default — set `SQZ_HOOK_DEBUG=1` to print one skip/hit line per
+    // invocation to the hook process's own stderr, which Claude Code does
+    // not feed back into the agent's context (unlike the compressed
+    // command's own stderr, which is deliberately merged via `2>&1`).
+    let hook_debug = std::env::var("SQZ_HOOK_DEBUG").is_ok();
+    macro_rules! log_skip {
+        ($reason:expr) => {
+            if hook_debug {
+                eprintln!("[sqz hook] skip ({}): {command}", $reason);
+            }
+        };
+    }
+
     // Don't intercept commands that are already piped through sqz.
     // Check the base command name specifically, not substring — so
     // "grep sqz logfile" or "cargo search sqz" aren't skipped.
@@ -213,6 +228,7 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
         || command.contains("sqz compress --cmd ")
         || command.contains("sqz.exe compress --cmd ")
     {
+        log_skip!("already-wrapped");
         return Ok(match platform {
             HookPlatform::Cursor => "{}".to_string(),
             _ => input.to_string(),
@@ -221,25 +237,48 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
 
     // Don't intercept interactive or long-running commands
     if is_interactive_command(command) {
+        log_skip!("interactive");
         return Ok(match platform {
             HookPlatform::Cursor => "{}".to_string(),
             _ => input.to_string(),
         });
     }
 
-    // Don't intercept commands with shell operators that would break piping.
-    // Compound commands (&&, ||, ;), redirects (>, <, >>), background (&),
-    // heredocs (<<), and process substitution would misbehave when we append
-    // `2>&1 | sqz compress` — the pipe only captures the last command.
-    if has_shell_operators(command) {
+    // Don't intercept commands where appending `2>&1 | sqz compress` would
+    // discard or misdirect the real output: an explicit redirect already
+    // sends stdout to a file, `&` backgrounds the command (nothing to wait
+    // on), and heredoc bodies would have our suffix land mid-body.
+    if has_unwrappable_shell_operators(command) {
+        log_skip!("unwrappable-operator");
         return Ok(match platform {
             HookPlatform::Cursor => "{}".to_string(),
             _ => input.to_string(),
         });
+    }
+
+    // Compound commands (&&, ||, ;), existing pipes, and command
+    // substitution are safe to capture too, but only if the *whole*
+    // expression is grouped in `(...)` first — otherwise the naive suffix
+    // only captures the last stage of the chain. PowerShell's grouping
+    // operator has different multi-statement semantics that haven't been
+    // verified here, so leave PowerShell commands on the old skip-only
+    // behavior rather than risk corrupting them.
+    let is_powershell = matches!(tool_name, "PowerShell" | "powershell" | "pwsh");
+    let wrap_in_subshell = needs_subshell_wrap(command);
+    if is_powershell && wrap_in_subshell {
+        log_skip!("powershell-compound-unverified");
+        return Ok(match platform {
+            HookPlatform::Cursor => "{}".to_string(),
+            _ => input.to_string(),
+        });
+    }
+
+    if hook_debug {
+        let how = if wrap_in_subshell { "subshell-wrapped" } else { "plain" };
+        eprintln!("[sqz hook] intercept ({how}): {command}");
     }
 
     // Rewrite: pipe the command's output through sqz compress.
-    // The command is a simple command (no operators), so direct piping is safe.
     //
     // Issue #10: use `--cmd NAME` instead of a `SQZ_CMD=NAME` prefix so
     // the rewrite works in every shell. The sh-style inline env-var
@@ -252,14 +291,20 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
     // formatter — `git status`, `cargo test`, `rake test`, `go test` — needs the
     // subcommand to dispatch. `format_command` splits and strips the path itself,
     // so a base-name-only label silently skipped those formatters in the live
-    // hook (they only fired in unit tests / the MCP path). The command is a
-    // simple command here (compound commands bailed out above via
-    // `has_shell_operators`), so quoting it as one arg is safe.
-    let rewritten = format!(
-        "{} 2>&1 | sqz compress --cmd {}",
-        command,
-        shell_escape(command),
-    );
+    // hook (they only fired in unit tests / the MCP path).
+    let rewritten = if wrap_in_subshell {
+        format!(
+            "({}) 2>&1 | sqz compress --cmd {}",
+            command,
+            shell_escape(command),
+        )
+    } else {
+        format!(
+            "{} 2>&1 | sqz compress --cmd {}",
+            command,
+            shell_escape(command),
+        )
+    };
 
     // Build platform-specific output.
     //
@@ -1463,6 +1508,12 @@ fn shell_escape(s: &str) -> String {
 /// Check if a command contains shell operators that would break piping.
 /// Commands with these operators are passed through uncompressed rather
 /// than risk incorrect behavior.
+///
+/// Used by the OpenCode hook path (`process_opencode_hook`), which does a
+/// flat rewrite with no subshell grouping. The Claude Code / Cursor /
+/// Windsurf / Gemini path (`process_hook_for_platform`) uses the split
+/// `has_unwrappable_shell_operators` / `needs_subshell_wrap` below instead,
+/// so compound commands and pipes get compressed rather than skipped.
 pub(crate) fn has_shell_operators(cmd: &str) -> bool {
     // Check for operators that would cause the pipe to only capture
     // the last command in a chain
@@ -1476,6 +1527,34 @@ pub(crate) fn has_shell_operators(cmd: &str) -> bool {
         || cmd.contains("<<")  // heredoc
         || cmd.contains("$(")  // command substitution
         || cmd.contains('`')   // backtick substitution
+}
+
+/// Real blockers: appending `2>&1 | sqz compress` after these would either
+/// discard the command's real output (stdout is already redirected to a
+/// file), run detached (background `&`, nothing to wait on before piping),
+/// or land mid-heredoc-body. No amount of subshell grouping fixes these,
+/// so these commands are passed through unmodified.
+pub(crate) fn has_unwrappable_shell_operators(cmd: &str) -> bool {
+    cmd.contains("<<") // heredoc body follows on subsequent lines
+        || cmd.contains('>') // explicit output redirect (`>` or `>>`)
+        || (cmd.contains('&') && !cmd.contains("&&")) // background `&`
+}
+
+/// Operators that are safe to capture as long as the *whole* expression is
+/// grouped in `(...)` before the pipe is appended — a naive `cmd 2>&1 | sqz
+/// compress` suffix would otherwise only capture the last stage of a
+/// chain/pipeline (e.g. only `cmd2`'s output from `cmd1 && cmd2`). Bare
+/// input redirection (`<`) is deliberately not included here: `cmd <
+/// file 2>&1 | sqz compress` already captures the right output without
+/// grouping, so treating it as a blocker only lost compression for no
+/// reason.
+pub(crate) fn needs_subshell_wrap(cmd: &str) -> bool {
+    cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains(';')
+        || cmd.contains('|') // existing pipe
+        || cmd.contains("$(") // command substitution
+        || cmd.contains('`') // backtick substitution
 }
 
 /// Check if a command is interactive or long-running (should not be intercepted).
@@ -1589,6 +1668,114 @@ mod tests {
         let input = r#"{"tool_name":"Bash","tool_input":{"command":"npm run dev --watch"}}"#;
         let result = process_hook(input).unwrap();
         assert_eq!(result, input, "watch mode should pass through");
+    }
+
+    #[test]
+    fn test_process_hook_subshell_wraps_compound_command() {
+        // Previously skipped entirely; now grouped in `(...)` so the whole
+        // chain's output is captured instead of just the last stage.
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"cargo build && cargo test"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.starts_with("(cargo build && cargo test) 2>&1 | sqz compress"),
+            "compound command should be subshell-wrapped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_subshell_wraps_existing_pipe() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"cat file.txt | grep foo"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.starts_with("(cat file.txt | grep foo) 2>&1 | sqz compress"),
+            "existing pipe should be subshell-wrapped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_subshell_wraps_command_substitution() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"echo \"today is $(date)\""}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.starts_with("(echo \"today is $(date)\") 2>&1 | sqz compress"),
+            "command substitution should be subshell-wrapped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_output_redirect() {
+        // No amount of subshell grouping recovers output already sent to a file.
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"echo hello > output.txt"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "explicit output redirect must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_heredoc() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"git commit -F- <<'EOF'\nfeat: subject\nEOF"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "heredoc must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_background() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"long_task &"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "background command must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_allows_bare_input_redirect_without_wrap() {
+        // Bare `<` doesn't need grouping — `sort < file 2>&1 | sqz compress`
+        // already captures the right output, so this should NOT be skipped
+        // and should NOT be subshell-wrapped either.
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"sort < file.txt"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.starts_with("sort < file.txt 2>&1 | sqz compress"),
+            "bare input redirect should be compressed without subshell wrapping: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_powershell_still_skips_compound() {
+        // PowerShell's `( ... )` grouping semantics for multi-statement
+        // chains are unverified, so compound PowerShell commands stay on
+        // the conservative skip-only path.
+        let input = r#"{"tool_name":"PowerShell","tool_input":{"command":"Get-Item a; Get-Item b"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "compound PowerShell commands must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_debug_flag_does_not_alter_stdout_json() {
+        // SQZ_HOOK_DEBUG only adds stderr logging; the returned JSON (what
+        // Claude Code parses from stdout) must be identical either way.
+        // Tests share process env, so serialize around the mutation.
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"cargo build && cargo test"}}"#;
+        let baseline = process_hook(input).unwrap();
+
+        std::env::set_var("SQZ_HOOK_DEBUG", "1");
+        let with_debug = process_hook(input).unwrap();
+        std::env::remove_var("SQZ_HOOK_DEBUG");
+
+        assert_eq!(baseline, with_debug, "debug flag must not change the emitted JSON");
     }
 
     #[test]
