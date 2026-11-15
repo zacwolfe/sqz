@@ -13,6 +13,7 @@ use crate::stages::{
 use crate::token_counter::TokenCounter;
 use crate::token_pruner::TokenPruner;
 use crate::toon::ToonEncoder;
+use crate::size_cap;
 use crate::types::{CompressedContent, Content, ContentType, ModelFamily, StageConfig};
 
 /// Minimal session context passed to the pipeline. Just carries the session
@@ -331,7 +332,7 @@ impl CompressionPipeline {
         // Skipped on the lossless path so a JSON file read returns its bytes
         // verbatim — TOON re-encoding is data-lossless but reformats and
         // shifts line numbers, which breaks "read this file faithfully".
-        let data = if !lossless && ToonEncoder::is_json(&content.raw) {
+        let mut data = if !lossless && ToonEncoder::is_json(&content.raw) {
             let json: serde_json::Value = serde_json::from_str(&content.raw)
                 .map_err(|e| SqzError::Other(format!("pipeline: JSON parse error: {e}")))?;
             let encoded = self.toon_encoder.encode(&json)?;
@@ -365,6 +366,13 @@ impl CompressionPipeline {
         } else {
             content.raw
         };
+
+        if !lossless {
+            if let Some(capped) = size_cap::cap_to_tokens(&data, size_cap::DEFAULT_MAX_TOKENS, |s| self.count_tokens(s, preset)) {
+                data = capped;
+                stages_applied.push("size_cap".to_owned());
+            }
+        }
 
         Ok(CompressedContent {
             data,

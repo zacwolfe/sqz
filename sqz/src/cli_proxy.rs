@@ -371,13 +371,17 @@ impl CliProxy {
             // Real token counts, as on the pipeline path: collapsing column
             // padding shrinks chars/4 a lot and BPE tokens hardly at all.
             let tokens_original = self.engine.count_tokens(output);
+            let (formatted, cap_hit) = match sqz_engine::size_cap::cap_to_tokens(&formatted, sqz_engine::size_cap::DEFAULT_MAX_TOKENS, |s| self.engine.count_tokens(s)) {
+                Some(c) => (c, true),
+                None => (formatted, false),
+            };
             let tokens_compressed = self.engine.count_tokens(&formatted);
-            if tokens_original.saturating_sub(tokens_compressed) >= NET_WIN_MIN_TOKENS {
+            if tokens_original.saturating_sub(tokens_compressed) >= NET_WIN_MIN_TOKENS || cap_hit {
                 // Persist to L2 cache — but skip if content contains secrets
-                // (confidence router detected high-risk patterns like API keys)
                 let never_store = self.engine.never_store(output);
                 if !never_store {
-                    if let Ok(compressed) = self.engine.compress(&formatted) {
+                    let to_store = if cap_hit { output } else { &formatted };
+                    if let Ok(compressed) = self.engine.compress(to_store) {
                         let _ = self.engine.cache_manager().store_compressed(output.as_bytes(), &compressed);
                     }
                 }
@@ -387,6 +391,12 @@ impl CliProxy {
                     && never_store
                     && self.engine.route_compression_mode(output) == sqz_engine::CompressionMode::Safe;
                 let shown = if safe { formatted } else { annotated };
+                if cap_hit && !never_store {
+                    let hash = sqz_engine::CacheManager::sha256_hex(output.as_bytes());
+                    let shown = format!("{shown}\n[full output: sqz expand {}]", &hash[..16]);
+                    self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                    return shown;
+                }
                 self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
                 return shown;
             }
@@ -399,7 +409,7 @@ impl CliProxy {
                 let lossy = compressed
                     .stages_applied
                     .iter()
-                    .any(|s| s == "entropy_truncate" || s == "toon_encode");
+                .any(|s| s == "entropy_truncate" || s == "toon_encode" || s == "size_cap");
                 // Persist to L2 cache, but never content that may contain
                 // secrets, API keys, passwords
                 let safe = self.engine.route_compression_mode(output) == sqz_engine::CompressionMode::Safe;
@@ -472,8 +482,9 @@ impl CliProxy {
                 // original passes through and no savings are recorded. The
                 // L2 store above still happens, so a repeat of this content
                 // resolves to a dedup ref.
+                let capped = compressed.stages_applied.iter().any(|s| s == "size_cap");
                 let tokens_final = self.engine.count_tokens(&abbreviated);
-                if tokens_original.saturating_sub(tokens_final) < NET_WIN_MIN_TOKENS {
+                if !capped && tokens_original.saturating_sub(tokens_final) < NET_WIN_MIN_TOKENS {
                     return if safe { output.to_owned() } else { self.apply_context_refs(output) };
                 }
 
@@ -1165,6 +1176,21 @@ mod tests {
                 "output must not contain '{wrong}' ({why}) — got:\n{result}"
             );
         }
+    }
+
+    #[test]
+    fn test_output_cap_limits_huge_output() {
+        let (proxy, _dir) = isolated_proxy();
+        // Build a ~1.3MB string: 24 lines, each ~55KB
+        let line = "a".repeat(55000);
+        let output = (0..24).map(|i| format!("line {i}: {line}")).collect::<Vec<_>>().join("\n");
+        
+        let result = proxy.intercept_output("huge_cmd", &output);
+        
+        let tokens = proxy.engine.count_tokens(&result);
+        assert!(tokens <= 8100, "expected tokens <= 8100, got {tokens}");
+        assert!(result.contains("chars omitted"), "expected 'chars omitted' in output");
+        assert!(result.ends_with(&format!("[full output: sqz expand {}]", &sqz_engine::CacheManager::sha256_hex(output.as_bytes())[..16])), "should end with expand hint");
     }
 
     #[test]

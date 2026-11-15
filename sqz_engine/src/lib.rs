@@ -52,6 +52,7 @@
 //! - [`CompressedContent`] — compression result with token counts and metadata
 
 pub mod adaptive_tree;
+pub mod size_cap;
 pub mod advanced_search;
 pub mod ansi_strip;
 pub mod api_proxy;
