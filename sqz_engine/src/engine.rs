@@ -18,6 +18,7 @@ use crate::session_store::{SessionStore, SessionSummary};
 use crate::terse_mode::TerseMode;
 use crate::types::{CompressedContent, PinEntry, Provenance, SessionId};
 use crate::verifier::Verifier;
+use crate::size_cap;
 
 /// Top-level facade that wires all sqz_engine modules together.
 ///
@@ -204,6 +205,10 @@ impl SqzEngine {
             .map_err(|_| SqzError::Other("preset lock poisoned".into()))?;
         let pipeline = self.pipeline.lock()
             .map_err(|_| SqzError::Other("pipeline lock poisoned".into()))?;
+        let max_tokens = preset
+            .compression
+            .max_output_tokens
+            .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
         let ctx = crate::pipeline::SessionContext {
             session_id: "engine".to_string(),
         };
@@ -218,7 +223,7 @@ impl SqzEngine {
             if std::env::var_os("SQZ_VERBOSE").is_some() {
                 eprintln!("[sqz] safe mode: high-risk content passed through unchanged");
             }
-            return self.compress_safe(input, &pipeline, &ctx, true);
+            return self.compress_safe(input, &pipeline, &ctx, true, max_tokens);
         }
 
         // Step 3: Compress with the configured pipeline
@@ -232,10 +237,20 @@ impl SqzEngine {
         // Step 5: If verifier signals low confidence, re-compress with safe settings
         if fallback && result.data != input {
             if !Self::quiet_stderr() {
-                eprintln!("[sqz] fallback: verifier confidence {:.2} below threshold — re-compressing in safe mode",
-                    result.verify.as_ref().map(|v| v.confidence).unwrap_or(0.0));
+                let failed = result
+                    .verify
+                    .as_ref()
+                    .map(|v| {
+                        v.checks_failed
+                            .iter()
+                            .map(|(check, _)| check.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                eprintln!("[sqz] fallback: verifier rejected [{failed}] - re-compressing in safe mode");
             }
-            let safe_result = self.compress_safe(input, &pipeline, &ctx, false)?;
+            let safe_result = self.compress_safe(input, &pipeline, &ctx, false, max_tokens)?;
             return Ok(safe_result);
         }
 
@@ -387,6 +402,13 @@ impl SqzEngine {
     /// - `CompressionMode::Default` → standard pipeline
     /// - `CompressionMode::Aggressive` → aggressive preset, verified, with a safe-mode fallback
     pub fn compress_with_mode(&self, input: &str, mode: crate::confidence_router::CompressionMode) -> Result<CompressedContent> {
+        // Same lock order as `compress` (preset before pipeline): taking them
+        // in the other order deadlocks against a concurrent `compress` call.
+        let max_tokens = self
+            .preset
+            .lock()
+            .map(|p| p.compression.max_output_tokens.unwrap_or(size_cap::DEFAULT_MAX_TOKENS))
+            .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
         let pipeline = self.pipeline.lock()
             .map_err(|_| SqzError::Other("pipeline lock poisoned".into()))?;
         let ctx = crate::pipeline::SessionContext {
@@ -397,7 +419,7 @@ impl SqzEngine {
             crate::confidence_router::CompressionMode::Safe => {
                 let lossless = self.confidence_router.route(input)
                     == crate::confidence_router::CompressionMode::Safe;
-                self.compress_safe(input, &pipeline, &ctx, lossless)
+                self.compress_safe(input, &pipeline, &ctx, lossless, max_tokens)
             }
             crate::confidence_router::CompressionMode::Aggressive => {
                 // High-risk content (secrets, migrations, panic backtraces)
@@ -405,7 +427,7 @@ impl SqzEngine {
                 if self.confidence_router.route(input)
                     == crate::confidence_router::CompressionMode::Safe
                 {
-                    return self.compress_safe(input, &pipeline, &ctx, true);
+                    return self.compress_safe(input, &pipeline, &ctx, true, max_tokens);
                 }
                 let current_preset = self
                     .preset
@@ -416,7 +438,18 @@ impl SqzEngine {
                 let mut result = pipeline.compress(input, &ctx, &aggressive)?;
                 let verify = Verifier::verify(input, &result.data);
                 if verify.fallback_triggered {
-                    return self.compress_safe(input, &pipeline, &ctx, false);
+                    if !Self::quiet_stderr() {
+                        let failed = verify
+                            .checks_failed
+                            .iter()
+                            .map(|(check, _)| check.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprintln!(
+                            "[sqz] fallback: verifier rejected aggressive [{failed}] - re-compressing in safe mode"
+                        );
+                    }
+                    return self.compress_safe(input, &pipeline, &ctx, false, max_tokens);
                 }
                 result.verify = Some(verify);
                 Ok(result)
@@ -436,6 +469,7 @@ impl SqzEngine {
         pipeline: &crate::pipeline::CompressionPipeline,
         ctx: &crate::pipeline::SessionContext,
         lossless: bool,
+        max_tokens: u32,
     ) -> Result<CompressedContent> {
         use crate::preset::{
             CompressionConfig, CondenseConfig, CustomTransformsConfig, BudgetConfig,
@@ -498,6 +532,18 @@ impl SqzEngine {
         if !lossless && verify.fallback_triggered {
             result = pipeline.compress_lossless(input, ctx, &safe_preset)?;
             verify = Verifier::verify(input, &result.data);
+        }
+        // The cap is a context-safety invariant, not a compression stage: a
+        // fallback that hands back the input verbatim must not smuggle a
+        // 165k-token dump past it.
+        // `pipeline` and the safe preset are already borrowed here, so count
+        // through them: `self.count_tokens` would re-lock the engine mutexes
+        // this call already holds.
+        if let Some(capped) = size_cap::cap_to_tokens(&result.data, max_tokens, |s| pipeline.count_tokens(s, &safe_preset)) {
+            result.data = capped;
+            if !result.stages_applied.iter().any(|s| s == "size_cap") {
+                result.stages_applied.push("size_cap".to_owned());
+            }
         }
         result.verify = Some(verify);
         result.provenance = Provenance {

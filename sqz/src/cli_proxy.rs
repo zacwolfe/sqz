@@ -222,15 +222,30 @@ fn only_trailing_space_differs(output: &str, formatted: &str) -> bool {
 /// Whether a formatter's output may stand in for `output`.
 ///
 /// Formatters drop lines by design (transfer progress, install logs, duplicate
-/// status lines), so on the Safe route a formatter is a lossy transform and has
-/// to clear the same verifier the pipeline uses. When verification fails the
-/// caller shows the raw output instead of the formatted reduction. Other routes
-/// keep the historical behaviour: the formatter is the intended transform.
+/// status lines), so on the Safe route a formatter is a lossy transform. It
+/// clears the formatter contract instead of the pipeline checks: every line
+/// carrying diagnostic signal has to survive verbatim. When it does not, the
+/// caller shows the raw output. Other routes keep the historical behaviour:
+/// the formatter is the intended transform.
 fn formatter_output_verified(engine: &SqzEngine, output: &str, formatted: &str) -> bool {
+    formatter_rejection(engine, output, formatted).is_none()
+}
+
+/// The formatter-contract violations, or `None` when the output may stand in.
+fn formatter_rejection(
+    engine: &SqzEngine,
+    output: &str,
+    formatted: &str,
+) -> Option<Vec<String>> {
     if engine.route_compression_mode(output) != sqz_engine::CompressionMode::Safe {
-        return true;
+        return None;
     }
-    !sqz_engine::Verifier::verify(output, formatted).fallback_triggered
+    let losses = sqz_engine::Verifier::formatter_losses(output, formatted);
+    if losses.is_empty() {
+        None
+    } else {
+        Some(losses)
+    }
 }
 
 pub struct CliProxy {
@@ -402,10 +417,11 @@ impl CliProxy {
                 None => (formatted, false),
             };
             let tokens_compressed = self.engine.count_tokens(&formatted);
-            if !formatter_output_verified(&self.engine, output, &formatted) {
+            if let Some(broken) = formatter_rejection(&self.engine, output, &formatted) {
                 if !quiet() {
                     eprintln!(
-                        "[sqz] formatter bypassed for '{cmd}': verification failed, showing raw output"
+                        "[sqz] formatter bypassed for '{cmd}': verification failed ({}), showing raw output",
+                        broken.join("; ")
                     );
                 }
                 return output.to_owned();
