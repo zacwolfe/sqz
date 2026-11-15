@@ -350,7 +350,7 @@ pub fn collapse_indexed_rows(text: &str, min_run_length: usize) -> Result<Indexe
     })
 }
 
-const INDEXED_SIGNAL_WORDS: [&str; 11] = [
+const INDEXED_SIGNAL_WORDS: [&str; 12] = [
     "error",
     "warning",
     "fatal",
@@ -362,6 +362,8 @@ const INDEXED_SIGNAL_WORDS: [&str; 11] = [
     "traceback",
     "backtrace",
     "stack trace",
+    "<<<",
+
 ];
 
 fn is_signal_row(line: &str) -> bool {
@@ -395,6 +397,12 @@ fn compatible_rows(a: &str, b: &str) -> bool {
     let differing: Vec<usize> = (0..left.len()).filter(|&k| left[k] != right[k]).collect();
     if differing.is_empty() || differing.len() > 2 {
         return false;
+    }
+    if differing.len() == 1 {
+        let k = differing[0];
+        if !left[k].chars().any(|c| c.is_ascii_digit()) {
+            return false;
+        }
     }
     for &k in &differing {
         let barred = |token: &str| token.contains('/') || token.contains('=') || token.contains('|');
@@ -780,7 +788,56 @@ done\n";
         assert_eq!(result.text, input);
     }
 
-    // --- RLE tests ---
+    #[test]
+    fn test_indexed_row_collapse_basic() {
+        let mut input = String::new();
+        for i in 1..=300 {
+            input.push_str(&format!("test case {i} ... ok\n"));
+        }
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 298);
+        assert!(result.text.contains("[×298 rows omitted: field 1 spans \"test case 1 ... ok\" .. \"test case 300 ... ok\", all other fields identical]"));
+    }
+
+    #[test]
+    fn test_indexed_row_signal_words_break_runs() {
+        let input = "\
+        test case 1 ... ok
+        test case 2 ... ok
+        error: something failed
+        test case 3 ... ok
+        test case 4 ... ok
+        <<< signal
+        test case 5 ... ok
+        test case 6 ... ok
+        test case 7 ... ok
+        test case 8 ... ok\n";
+        let result = collapse_indexed_rows(&input, 3).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert!(result.text.contains("error: something failed"));
+        assert!(result.text.contains("<<< signal"));
+    }
+
+    #[test]
+    fn test_indexed_row_min_length() {
+        let input = "a 1\na 2\na 3\n";
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn test_indexed_row_aligned_two_token_collapse() {
+        let mut input = String::new();
+        for i in 1..=10 {
+            input.push_str(&format!("ALTER TABLE t_{i} ADD COLUMN col_{i} TEXT\n"));
+        }
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert!(result.text.contains("[×8 rows omitted"));
+    }
+
 
     #[test]
     fn test_rle_no_repetition() {
