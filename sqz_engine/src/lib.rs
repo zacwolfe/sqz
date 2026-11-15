@@ -89,6 +89,7 @@ pub mod opencode_plugin;
 pub mod rle_compressor;
 pub mod simhash;
 pub mod table_compactor;
+pub mod template_collapse;
 pub mod textrank;
 pub mod token_pruner;
 pub mod tool_hooks;

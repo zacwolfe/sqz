@@ -423,6 +423,23 @@ impl CompressionPipeline {
             }
         }
 
+        // Template row grouping runs last, on the text that will actually ship.
+        // Rows that repeat one message with one distinct payload each (150
+        // compiler errors at 150 locations, one `ALTER TABLE` per table, one
+        // fetch line per package) collapse to the message once plus the values
+        // per row. The block is invertible (`expand_declared_templates`), so
+        // every path, number, and message string is still in the output.
+        //
+        // Running it after `size_cap` matters: a cap that cuts head and tail
+        // would otherwise slice through a block and leave a row count that no
+        // longer matches the rows beneath it.
+        if !lossless && !is_json && !is_code && !diff_folded && data.len() > 400 {
+            if let Some(fold) = crate::template_collapse::collapse_template_runs(&data, 6, 0.3) {
+                data = fold.text;
+                stages_applied.push("template_collapse".to_owned());
+            }
+        }
+
         Ok(CompressedContent {
             data,
             tokens_compressed: 0,
@@ -869,6 +886,39 @@ mod tests {
             verify.passed,
             "verifier rejected the folded diff: {:?}\n--- output ---\n{}",
             verify.checks_failed, out.data
+        );
+    }
+
+    /// Long runs of one message with a distinct payload per row (one fetch per
+    /// package, one compiler error per location) must collapse to the message
+    /// once plus the values, and the verifier must still accept the result.
+    #[test]
+    fn template_collapse_fires_and_passes_the_verifier() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "src/features/module_{i}/Widget{i}.tsx({i},13): error TS2322: Type 'string' is not assignable to type 'number'.\n"
+            ));
+        }
+        let out = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(
+            out.stages_applied.iter().any(|s| s == "template_collapse"),
+            "template_collapse did not run; stages: {:?}",
+            out.stages_applied
+        );
+        assert_eq!(
+            out.data.matches("error TS2322").count(),
+            1,
+            "the shared message should appear once, not per row: {}",
+            out.data
+        );
+        let verify = crate::verifier::Verifier::verify(&input, &out.data);
+        assert!(
+            verify.passed,
+            "verifier rejected the template fold: {:?}\n--- output ---\n{}",
+            verify.checks_failed,
+            out.data
         );
     }
 

@@ -48,6 +48,17 @@ impl Verifier {
         // survive no matter what (`carries_signal`); when it is absent,
         // everything the input contained is still required.
         let declared_omission = declares_omission(compressed);
+        // Declared template blocks are an invertible encoding: the block names
+        // its row count, prints the row template once with `%` per variable
+        // field, and lists each row's values in field order. Expanding them
+        // before the content checks keeps every invariant strict (nothing may
+        // be missing) while letting forty rows that share one message collapse
+        // to that message plus their forty locations. A malformed block is left
+        // unexpanded, so a buggy stage cannot use a bogus block to launder a
+        // loss: the expansion has to reproduce the original strings or the
+        // checks still fail.
+        let expanded = crate::template_collapse::expand_declared_templates(compressed);
+        let search = expanded.as_str();
         let must_survive: Vec<&str> = if declared_omission {
             original
                 .lines()
@@ -85,7 +96,7 @@ impl Verifier {
             passed.push("error_lines".to_string());
         } else {
             let trimmed: Vec<&str> = error_lines.iter().map(|l| l.trim()).collect();
-            let missing = text_search::present(compressed, &trimmed)
+            let missing = text_search::present(search, &trimmed)
                 .iter()
                 .filter(|&&p| !p)
                 .count();
@@ -125,7 +136,7 @@ impl Verifier {
                     let token = line.split_whitespace()
                         .find(|t| t.contains('/') || t.contains('\\'))
                         .unwrap_or("");
-                    !token.is_empty() && !compressed.contains(token)
+                    !token.is_empty() && !search.contains(token)
                 })
                 .count();
             if missing_paths == 0 {
@@ -156,7 +167,7 @@ impl Verifier {
                 } else {
                     let present: usize = orig_keys
                         .iter()
-                        .filter(|&&k| compressed.contains(k))
+                        .filter(|&&k| search.contains(k))
                         .count();
                     let retention_ratio = present as f64 / orig_keys.len() as f64;
                     // Pass if at least 50% of original keys are present
@@ -165,7 +176,7 @@ impl Verifier {
                     } else {
                         let missing: Vec<&str> = orig_keys
                             .iter()
-                            .filter(|&&k| !compressed.contains(k))
+                            .filter(|&&k| !search.contains(k))
                             .copied()
                             .collect();
                         failed.push((
@@ -191,7 +202,7 @@ impl Verifier {
         if hunk_headers.is_empty() {
             passed.push("diff_hunks".to_string());
         } else {
-            let missing_hunks = text_search::present(compressed, &hunk_headers)
+            let missing_hunks = text_search::present(search, &hunk_headers)
                 .iter()
                 .filter(|&&p| !p)
                 .count();
@@ -219,13 +230,13 @@ impl Verifier {
         //   (`running 300 tests`); demanding those numbers made every cargo
         //   test formatter trip the gate. When the line survived, its numbers
         //   must survive with it.
-        let numbers = numbers_on_surviving_lines(original, compressed, declared_omission);
+        let numbers = numbers_on_surviving_lines(original, search, declared_omission);
         if numbers.is_empty() {
             passed.push("numeric_values".to_string());
         } else {
             let missing_nums = numbers
                 .iter()
-                .filter(|&&n| !compressed.contains(n))
+                .filter(|&&n| !search.contains(n))
                 .count();
             if missing_nums == 0 {
                 passed.push("numeric_values".to_string());
@@ -262,7 +273,7 @@ impl Verifier {
             passed.push("preservation".to_string());
         } else {
             let tokens: Vec<&str> = preservation_tokens.iter().map(String::as_str).collect();
-            let hits = text_search::present(compressed, &tokens);
+            let hits = text_search::present(search, &tokens);
             let present = hits.iter().filter(|&&p| p).count();
             let total = preservation_tokens.len();
             let ratio = present as f64 / total as f64;
