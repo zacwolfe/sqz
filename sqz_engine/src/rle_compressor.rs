@@ -959,6 +959,29 @@ done\n";
     }
 
     #[test]
+    fn indexed_rows_break_a_run_at_an_error_line() {
+        let input = "\
+report_0 written
+report_1 written
+report_2 written
+report_3 written
+error: shard 4 is unavailable
+report_5 written
+report_6 written
+report_7 written
+report_8 written
+";
+        let result = collapse_indexed_rows(input, 3).unwrap();
+        assert!(
+            result.text.contains("error: shard 4 is unavailable"),
+            "a signal line is never folded into a range: {}",
+            result.text
+        );
+        assert_eq!(result.runs_collapsed, 2, "the run splits around the error");
+        assert!(!result.text.contains("report_2"), "inner rows still collapse");
+    }
+
+    #[test]
     fn indexed_rows_leave_short_runs_alone() {
         let input = cargo_rows(3);
         let result = collapse_indexed_rows(&input, 4).unwrap();
