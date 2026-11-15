@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_returns_the_input_instead_of_a_rejected_reduction() {
+    fn path_rows_survive_output_truncation_while_filler_is_dropped() {
         let (proxy, _dir) = isolated_proxy();
         let output = (0..24)
             .map(|i| {
@@ -1168,15 +1168,27 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let fallback = proxy.engine.compress(&output).unwrap();
-        assert_eq!(fallback.provenance.label.as_deref(), Some("safe-fallback"));
-        // The lossy candidate dropped file paths, so verification failed. The
-        // fallback must not hand that reduction back: it returns the input.
-        assert_eq!(fallback.data, output, "fallback returned a rejected reduction");
-        assert!(!fallback.data.contains("low-information segments omitted"));
+        // Byte-entropy ranking scored the single-byte `llllllll` filler rows
+        // below the plain prose, so truncation dropped the rows carrying file
+        // paths. Identity-bearing rows now outrank filler.
+        let compressed = proxy.engine.compress(&output).unwrap();
+        for i in (0..24).step_by(2) {
+            assert!(
+                compressed.data.contains(&format!("/srv/app/mod_{i}.py")),
+                "dropped path row {i}: {}",
+                compressed.data
+            );
+        }
+        assert!(!compressed.data.contains("quick brown fox"), "{}", compressed.data);
+        assert!(compressed.data.contains("low-information segments omitted"), "{}", compressed.data);
+        assert!(compressed.data.len() < output.len());
+        assert!(compressed.verify.as_ref().is_some_and(|v| v.passed));
+
         let result = proxy.intercept_output("tail app.log", &output);
-        assert_eq!(result, output, "intercept_output returned a rejected reduction");
-        assert!(!result.contains("low-information segments omitted"), "{result}");
+        for i in (0..24).step_by(2) {
+            assert!(result.contains(&format!("/srv/app/mod_{i}.py")), "{result}");
+        }
+        assert!(result.contains("low-information segments omitted"), "{result}");
     }
 
     fn api_response_json() -> String {

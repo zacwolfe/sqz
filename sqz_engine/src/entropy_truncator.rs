@@ -111,48 +111,78 @@ impl EntropyTruncator {
             })
             .collect();
 
-        // Determine threshold: use override or compute median
+        // Rank identity-bearing segments (file paths, URLs, SHAs, ticket ids,
+        // versions) ahead of character-entropy score. Shannon entropy over
+        // bytes cannot see value: a row padded with `llllllll` filler has few
+        // distinct byte values and scores *low*, while a row carrying a path
+        // the agent will copy-paste scores high only because it is long. That
+        // ordering dropped exactly the rows worth keeping, so identity is now
+        // the primary key and entropy only orders the rest.
+        let total = scored.len();
+        // `always` = never dropped (too short to matter, or carries an error
+        // marker); `identity` = ranked above the entropy cutoff but still
+        // subject to the drop budget, so a log where most rows hold a path
+        // still compresses instead of degenerating to a passthrough.
+        let mut always: Vec<bool> = Vec::with_capacity(total);
+        let mut identity: Vec<bool> = Vec::with_capacity(total);
+        for seg in &scored {
+            always.push(
+                seg.text.len() < self.config.min_segment_length || has_error_marker(&seg.text),
+            );
+            identity.push(has_identity_token(&seg.text));
+        }
+
+        // Threshold: override, or the median entropy of the segments that are
+        // not already force-kept (keeps the cutoff tied to droppable content).
         let threshold = self.config.min_entropy_override.unwrap_or_else(|| {
-            let mut entropies: Vec<f64> = scored.iter().map(|s| s.entropy).collect();
+            let mut entropies: Vec<f64> = scored
+                .iter()
+                .zip(always.iter())
+                .filter(|(_, always)| !**always)
+                .map(|(s, _)| s.entropy)
+                .collect();
+            if entropies.len() < 2 {
+                entropies = scored.iter().map(|s| s.entropy).collect();
+            }
             entropies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             median(&entropies)
         });
 
-        // Mark segments below threshold for dropping
-        let mut kept_count = 0usize;
-        let total = scored.len();
+        // Keep score-ranked: forced segments first, then the highest-entropy
+        // remainder. Ties at the cutoff keep the earlier segment so the output
+        // stays deterministic.
+        let mut order: Vec<usize> = (0..total).collect();
+        order.sort_by(|&a, &b| {
+            always[b]
+                .cmp(&always[a])
+                .then_with(|| identity[b].cmp(&identity[a]))
+                .then_with(|| {
+                    scored[b]
+                        .entropy
+                        .partial_cmp(&scored[a].entropy)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.cmp(&b))
+        });
+
+        // Keep the top half (the distortion budget). Untouchable segments are
+        // kept even when they alone exceed the budget: dropping an error line
+        // is never the right trade.
+        let always_count = always.iter().filter(|a| **a).count();
+        let keep_budget = total
+            .div_ceil(2)
+            .max(always_count)
+            .max(self.config.min_kept_segments.min(total));
 
         for seg in &mut scored {
-            if seg.text.len() < self.config.min_segment_length || has_error_marker(&seg.text) {
-                seg.kept = true;
-                kept_count += 1;
-            } else if seg.entropy >= threshold {
-                seg.kept = true;
-                kept_count += 1;
-            } else {
-                seg.kept = false;
-            }
+            seg.kept = false;
         }
-
-        // Ensure we keep at least min_kept_segments
-        if kept_count < self.config.min_kept_segments {
-            // Re-add the highest-entropy dropped segments
-            let mut dropped_indices: Vec<(usize, f64)> = scored
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.kept)
-                .map(|(i, s)| (i, s.entropy))
-                .collect();
-            dropped_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            for (idx, _) in dropped_indices {
-                if kept_count >= self.config.min_kept_segments {
-                    break;
-                }
-                scored[idx].kept = true;
-                kept_count += 1;
-            }
+        for &idx in order.iter().take(keep_budget) {
+            scored[idx].kept = true;
         }
+        // `keep_budget` already honors `min_kept_segments`, so the kept count
+        // below is final.
+        let kept_count = scored.iter().filter(|s| s.kept).count();
 
         let segments_dropped = total - kept_count;
 
@@ -289,6 +319,45 @@ fn has_error_marker(text: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Whether a segment carries a token an agent would copy-paste verbatim: a
+/// filesystem path, a URL, or an identifier (SHA, UUID, ticket code, version).
+///
+/// Character entropy cannot answer this. Filler like `llllllllllll` uses a
+/// handful of distinct bytes and scores near zero, while ordinary prose with a
+/// wide alphabet scores high, so a pure entropy cutoff ranks the useless
+/// segment above the one holding `/srv/app/mod_7.py`. These segments are
+/// force-kept instead.
+fn has_identity_token(text: &str) -> bool {
+    if !extract_identifiers(text, "").is_empty() {
+        return true;
+    }
+    text.split_whitespace().any(is_path_or_url)
+}
+
+/// Conservative path/URL test for a single whitespace-delimited token.
+fn is_path_or_url(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| {
+        matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '\'' | '"' | '`')
+    });
+    if token.contains("://") {
+        return true;
+    }
+    let looks_relative = token.starts_with("./") || token.starts_with("../") || token.starts_with("~/");
+    let looks_absolute = token.starts_with('/') && token.len() > 1;
+    if !(looks_relative || looks_absolute || token.contains('/')) {
+        return false;
+    }
+    if looks_relative || looks_absolute {
+        return true;
+    }
+    // Relative path without a leading `./`: require a file-ish tail so that
+    // prose slashes ("and/or") are not treated as paths.
+    match token.rsplit('/').next() {
+        Some(tail) => tail.contains('.') && tail.len() > 1,
+        None => false,
+    }
+}
+
 /// Extract exact identifiers from `dropped` that do not also appear in
 /// `kept`: hex ids/SHAs (7+ chars containing a digit), UUIDs, ticket codes
 /// (ABC-123), and semantic versions. Capped at 16 entries / 256 chars total
@@ -416,24 +485,61 @@ mod tests {
     #[test]
     fn factsheet_preserves_ids_from_dropped_segments() {
         let truncator = EntropyTruncator::new();
-        // Low-entropy segments carrying identifiers, high-entropy segments
-        // without them. The low ones get dropped; their ids must survive
-        // in the factsheet line.
+        // Three identifier-carrying segments compete for a two-segment budget,
+        // so one of them is dropped despite ranking above the prose. Its ids
+        // must survive in the factsheet line.
         let low_a = format!("{} deadbeef42 PROJ-1482", "aaaaaaaaaa ".repeat(8));
         let low_b = format!(
             "{} 550e8400-e29b-41d4-a716-446655440000 v1.4.0",
             "bbbbbbbbbb ".repeat(8)
         );
-        let high_a = "The quick brown fox jumps over the lazy dog by silver rivers today.";
-        let high_b = "Zephyrs quickly vex jumbled gnomes while quartz dwarfs mix pyjamas.";
-        let input = format!("{low_a}\n\n{high_a}\n\n{low_b}\n\n{high_b}");
+        let low_c = format!("{} c0ffee1337 PROJ-9999", "cccccccccc ".repeat(8));
+        let prose = "Zephyrs quickly vex jumbled gnomes while quartz dwarfs mix pyjamas.";
+        let input = format!("{low_a}\n\n{prose}\n\n{low_b}\n\n{low_c}");
 
         let result = truncator.truncate_string(&input).unwrap();
         assert!(result.segments_dropped > 0, "fixture must drop segments");
         assert!(result.text.contains("[ids in omitted segments:"), "{}", result.text);
-        for id in ["deadbeef42", "PROJ-1482", "550e8400-e29b-41d4-a716-446655440000", "v1.4.0"] {
+        for id in [
+            "deadbeef42",
+            "PROJ-1482",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "v1.4.0",
+            "c0ffee1337",
+            "PROJ-9999",
+        ] {
             assert!(result.text.contains(id), "lost id {id}: {}", result.text);
         }
+    }
+
+    #[test]
+    fn path_rows_outrank_byte_entropy_filler() {
+        let truncator = EntropyTruncator::new();
+        let input = (0..24)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("SEG{i} /srv/app/mod_{i}.py {}", "l".repeat(40))
+                } else {
+                    format!("SEG{i} the quick brown fox jumps over {i} lazy dogs by silver rivers")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let result = truncator.truncate_string(&input).unwrap();
+        assert!(result.segments_dropped > 0, "fixture must truncate");
+        for i in (0..24).step_by(2) {
+            assert!(
+                result.text.contains(&format!("mod_{i}.py")),
+                "dropped path row {i}: {}",
+                result.text
+            );
+        }
+        assert!(
+            !result.text.contains("quick brown fox"),
+            "prose filler outranked a path row: {}",
+            result.text
+        );
     }
 
     #[test]

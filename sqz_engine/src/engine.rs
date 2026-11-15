@@ -908,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_returns_lossless_instead_of_a_rejected_reduction() {
+    fn path_rows_survive_truncation_while_filler_is_dropped() {
         use crate::confidence_router::CompressionMode;
         let dir = tempfile::tempdir().unwrap();
         let engine = SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db")).unwrap();
@@ -924,14 +924,26 @@ mod tests {
             .join("\n\n");
         assert_ne!(engine.route_compression_mode(&input), CompressionMode::Safe);
         let result = engine.compress(&input).unwrap();
-        assert_eq!(result.provenance.label.as_deref(), Some("safe-fallback"));
-        // The truncated candidate dropped file paths, which is what the
-        // verifier flagged. Returning it anyway is the circular fallback this
-        // fix removes: the retry has to hand back the bytes it was given.
-        assert_eq!(result.data, input);
-        assert!(!result.data.contains("low-information segments omitted"));
+        // Byte-entropy ranking used to score the `llllllll` filler rows below
+        // the plain prose (filler repeats a single byte) and drop exactly the
+        // rows holding a file path. Identity-bearing segments now outrank
+        // filler, so the truncation removes prose and keeps every path.
+        for i in (0..24).step_by(2) {
+            assert!(
+                result.data.contains(&format!("/srv/app/mod_{i}.py")),
+                "dropped path row {i}: {}",
+                result.data
+            );
+        }
+        assert!(
+            !result.data.contains("quick brown fox"),
+            "filler survived instead of being truncated: {}",
+            result.data
+        );
+        assert!(result.data.contains("low-information segments omitted"), "{}", result.data);
+        assert!(result.data.len() < input.len());
         assert!(result.verify.as_ref().is_some_and(|v| v.passed));
-        assert_eq!(result.data, engine.compress_with_mode(&input, CompressionMode::Safe).unwrap().data);
+        assert_eq!(result.provenance.label.as_deref(), None);
     }
 
     #[test]
