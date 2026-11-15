@@ -473,6 +473,91 @@ impl CompressionStage for CollapseArraysStage {
     }
 }
 
+/// Shrink arrays until each one's compact JSON fits `max_chars`, counting any
+/// summary element an earlier pass left behind.
+///
+/// [`collapse_arrays_recursive`] replaces dropped elements with the count it
+/// dropped, so a second pass that also removed that summary element would lose
+/// the number. This reads the count back out, adds it to the elements it drops,
+/// and writes the combined total into the new summary, so
+/// `kept + remaining` stays the original length however many times it runs.
+/// Returns whether anything changed.
+pub fn cap_json_arrays_to_chars(
+    value: &mut serde_json::Value,
+    max_items: usize,
+    max_chars: usize,
+    summary_template: &str,
+) -> bool {
+    fn carried_remaining(text: &str, template: &str) -> Option<usize> {
+        let (prefix, suffix) = template.split_once("{remaining}")?;
+        text.strip_prefix(prefix)?.strip_suffix(suffix)?.trim().parse().ok()
+    }
+
+    match value {
+        serde_json::Value::Array(arr) => {
+            let mut changed = false;
+            for item in arr.iter_mut() {
+                changed |= cap_json_arrays_to_chars(item, max_items, max_chars, summary_template);
+            }
+            let sizes: Vec<usize> = arr
+                .iter()
+                .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+                .collect();
+            let total = sizes.iter().sum::<usize>() + sizes.len() + 1;
+            if total <= max_chars || arr.len() <= max_items {
+                return changed;
+            }
+
+            // Pull off trailing summary elements and keep the counts they carry.
+            let mut carried = 0usize;
+            while let Some(serde_json::Value::String(text)) = arr.last() {
+                match carried_remaining(text, summary_template) {
+                    Some(n) => {
+                        carried += n;
+                        arr.pop();
+                    }
+                    None => break,
+                }
+            }
+            let real_len = arr.len();
+            if real_len <= max_items {
+                return changed;
+            }
+
+            let mut keep = 0;
+            let mut used = 2;
+            for item in &arr[..real_len] {
+                let size = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
+                if keep >= max_items && used + size + 1 > max_chars {
+                    break;
+                }
+                used += size + 1;
+                keep += 1;
+            }
+            if keep >= real_len {
+                if carried > 0 {
+                    let summary = summary_template.replace("{remaining}", &carried.to_string());
+                    arr.push(serde_json::Value::String(summary));
+                }
+                return changed;
+            }
+            let remaining = real_len - keep + carried;
+            arr.truncate(keep);
+            let summary = summary_template.replace("{remaining}", &remaining.to_string());
+            arr.push(serde_json::Value::String(summary));
+            true
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for v in map.values_mut() {
+                changed |= cap_json_arrays_to_chars(v, max_items, max_chars, summary_template);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stage 7a: word_abbreviate
 // ---------------------------------------------------------------------------
@@ -1407,5 +1492,38 @@ mod tests {
     fn replace_whole_word_empty_inputs() {
         assert_eq!(replace_whole_word("", "word", "w"), "");
         assert_eq!(replace_whole_word("text", "", "w"), "text");
+    }
+
+    #[test]
+    fn array_cap_folds_in_a_count_an_earlier_pass_declared() {
+        let template = "... and {remaining} more items";
+        let mut value = serde_json::json!({ "samples": vec![0; 100] });
+        assert!(cap_json_arrays_to_chars(&mut value, 5, 40, template));
+        let after_first = value["samples"].as_array().unwrap().clone();
+        let first_summary = after_first.last().unwrap().as_str().unwrap().to_owned();
+        assert!(first_summary.starts_with("... and "), "{first_summary}");
+
+        assert!(cap_json_arrays_to_chars(&mut value, 5, 20, template));
+        let after_second = value["samples"].as_array().unwrap();
+        let summary = after_second.last().unwrap().as_str().unwrap();
+        let remaining: usize = summary
+            .strip_prefix("... and ")
+            .and_then(|s| s.strip_suffix(" more items"))
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert_eq!(
+            after_second.len() - 1 + remaining,
+            100,
+            "kept plus declared must still be the original length: {summary}"
+        );
+        assert!(after_second.len() < after_first.len(), "the second pass shrinks");
+    }
+
+    #[test]
+    fn array_cap_leaves_a_small_array_alone() {
+        let template = "... and {remaining} more items";
+        let mut value = serde_json::json!({ "tags": ["a", "b", "c"] });
+        assert!(!cap_json_arrays_to_chars(&mut value, 5, 40, template));
+        assert_eq!(value["tags"], serde_json::json!(["a", "b", "c"]));
     }
 }

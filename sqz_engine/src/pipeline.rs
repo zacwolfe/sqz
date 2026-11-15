@@ -22,6 +22,14 @@ pub struct SessionContext {
     pub session_id: String,
 }
 
+/// Items an array keeps at minimum when the token cap has to shrink a JSON
+/// payload by dropping elements, so a long array still shows its shape.
+const ARRAY_CAP_MIN_ITEMS: usize = 5;
+
+/// Summary line the array cap writes, matching the `collapse_arrays` stage so
+/// a count the stage already declared is folded in rather than dropped.
+const ARRAY_CAP_SUMMARY: &str = "... and {remaining} more items";
+
 /// The compression pipeline orchestrator.
 ///
 /// Runs content through a sequence of configurable stages (condense, strip
@@ -394,6 +402,9 @@ impl CompressionPipeline {
         // Skipped on the lossless path so a JSON file read returns its bytes
         // verbatim — TOON re-encoding is data-lossless but reformats and
         // shifts line numbers, which breaks "read this file faithfully".
+        // The parsed value survives for the cap below, which shrinks a JSON
+        // payload by dropping whole array items instead of slicing its text.
+        let mut json_value: Option<serde_json::Value> = None;
         let mut data = if !lossless && ToonEncoder::is_json(&content.raw) {
             let json: serde_json::Value = serde_json::from_str(&content.raw)
                 .map_err(|e| SqzError::Other(format!("pipeline: JSON parse error: {e}")))?;
@@ -414,7 +425,7 @@ impl CompressionPipeline {
             } else {
                 None
             };
-            match with_dict {
+            let chosen = match with_dict {
                 Some(dict) if dict.len() < encoded.len() => {
                     stages_applied.push("dict_compress".to_owned());
                     stages_applied.push("toon_encode".to_owned());
@@ -424,7 +435,9 @@ impl CompressionPipeline {
                     stages_applied.push("toon_encode".to_owned());
                     encoded
                 }
-            }
+            };
+            json_value = Some(json);
+            chosen
         } else {
             content.raw
         };
@@ -434,7 +447,27 @@ impl CompressionPipeline {
                 .compression
                 .max_output_tokens
                 .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
-            if let Some(capped) = size_cap::cap_to_tokens(&data, max_tokens, |s| self.count_tokens(s, preset)) {
+            // A head/tail slice is only readable when the payload is text. Cut
+            // a JSON or TOON body and the result parses as neither, so those
+            // shrink by dropping whole array items and re-encoding instead.
+            if let Some(mut value) = json_value.take() {
+                let mut budget = crate::stages::DEFAULT_COLLAPSE_MAX_CHARS;
+                while self.count_tokens(&data, preset) > max_tokens && budget > 16 {
+                    budget /= 2;
+                    if !crate::stages::cap_json_arrays_to_chars(
+                        &mut value,
+                        ARRAY_CAP_MIN_ITEMS,
+                        budget,
+                        ARRAY_CAP_SUMMARY,
+                    ) {
+                        break;
+                    }
+                    data = self.toon_encoder.encode(&value)?;
+                    if !stages_applied.contains(&"array_cap".to_owned()) {
+                        stages_applied.push("array_cap".to_owned());
+                    }
+                }
+            } else if let Some(capped) = size_cap::cap_to_tokens(&data, max_tokens, |s| self.count_tokens(s, preset)) {
                 data = capped;
                 stages_applied.push("size_cap".to_owned());
             }
@@ -1123,6 +1156,43 @@ fn main() {
             let expected = if n < 3 { input.clone() } else { format!("{head}{line} [×{n}]\n{tail}") };
             assert_eq!(result.data, expected, "n={n}");
         }
+    }
+
+    #[test]
+    fn json_over_the_token_cap_shrinks_arrays_instead_of_slicing() {
+        let mut preset = default_preset();
+        preset.compression.max_output_tokens = Some(400);
+        let pipeline = CompressionPipeline::new(&preset);
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "samples": vec![0; 20_000],
+        }))
+        .unwrap();
+        let result = pipeline.compress(&pretty, &ctx(), &preset).unwrap();
+        assert!(
+            !result.data.contains("chars omitted"),
+            "a machine-readable payload is never sliced: {}",
+            &result.data[..result.data.len().min(200)]
+        );
+        assert!(
+            result.stages_applied.contains(&"array_cap".to_owned()),
+            "the cap shrinks arrays: {:?}",
+            result.stages_applied
+        );
+        let decoded = ToonEncoder.decode(&result.data).expect("TOON output still decodes");
+        let arr = decoded["samples"].as_array().unwrap();
+        let (summary, kept) = arr.split_last().unwrap();
+        let remaining: usize = summary
+            .as_str()
+            .and_then(|s| s.strip_prefix("... and "))
+            .and_then(|s| s.strip_suffix(" more items"))
+            .and_then(|n| n.parse().ok())
+            .expect("summary names how many were dropped");
+        assert_eq!(kept.len() + remaining, 20_000, "no sample is lost uncounted");
+        assert!(
+            kept.len() < 1_000,
+            "the array is cut to fit the cap, kept {}",
+            kept.len()
+        );
     }
 
     #[test]
