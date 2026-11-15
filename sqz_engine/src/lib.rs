@@ -85,6 +85,7 @@ pub mod litm_positioner;
 pub mod mdl_selector;
 pub mod minhash_lsh;
 pub mod ngram_abbreviator;
+pub mod noise_run;
 pub mod opencode_plugin;
 pub mod rle_compressor;
 pub mod simhash;

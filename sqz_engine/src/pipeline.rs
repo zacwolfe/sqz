@@ -305,6 +305,23 @@ impl CompressionPipeline {
             }
         }
 
+        // Terminal progress coalescing: progress bars, transfer status rows,
+        // and repeated "Downloading ..." lines redraw one row or restate the
+        // same transient message. Every stage above keys on stable content
+        // (identical neighbours, masked timestamps, a varying index), so these
+        // lines survive all of them and are charged to the reader. The last
+        // redraw frame is what a terminal showed, and a run keeps its first
+        // line plus a declared count. Error lines and any run containing one
+        // are left untouched. Skipped on the lossless path.
+        if !lossless && !is_json && !is_code && content.raw.len() > 200 {
+            if let Ok(nr_result) = crate::noise_run::collapse_noise_runs(&content.raw, 4) {
+                if nr_result.lines_removed > 0 || nr_result.frames_collapsed > 0 {
+                    content.raw = nr_result.text;
+                    stages_applied.push("noise_run".to_owned());
+                }
+            }
+        }
+
         // Sliding window dedup: catch repeated substrings across non-adjacent lines.
         // Skipped on the lossless path — its `[→Ln]` back-references have no
         // agent-facing expand path and make a file read non-faithful (#32).
