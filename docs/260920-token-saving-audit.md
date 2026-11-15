@@ -1,6 +1,6 @@
 # sqz token-saving audit
 
-What this document is: the ten fixes that came out of the 260920 audit of the
+What this document is: the fixes that came out of the 260920 audit of the
 compression pipeline, what each one changed, and what it measured on a fixed
 corpus. Numbers in the tables come from the commands in
 [Measurement](#measurement), run on this machine against the checked-out tree.
@@ -41,7 +41,7 @@ Three comparison points:
 
 | fixture | input | series | reduction | fix05 | reduction | HEAD | reduction |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| api.json | 26533 | 10979 | 58.6% | 9139 | 65.6% | 9139 | 65.6% |
+| api.json | 26533 | 10979 | 58.6% | 9139 | 65.6% | 7267 | 72.6% |
 | cargo_test.txt | 8418 | 8418 | 0.0% | 8418 | 0.0% | 283 | 96.6% |
 | docker.txt | 6482 | 3886 | 40.0% | 3886 | 40.0% | 3630 | 44.0% |
 | gitdiff.txt | 22628 | 22628 | 0.0% | 20167 | 10.9% | 3223 | 85.8% |
@@ -51,9 +51,9 @@ Three comparison points:
 | pytest.txt | 13612 | 8802 | 35.3% | 8802 | 35.3% | 6998 | 48.6% |
 | server.log | 99573 | 50835 | 48.9% | 11444 | 88.5% | 5950 | 94.0% |
 | tsc.txt | 14690 | 14690 | 0.0% | 13423 | 8.6% | 4945 | 66.3% |
-| **total** | **221746** | **134448** | **39.4%** | **89014** | **59.9%** | **46811** | **78.9%** |
+| **total** | **221746** | **134448** | **39.4%** | **89014** | **59.9%** | **44939** | **79.7%** |
 
-## The ten fixes
+## The fixes
 
 Each row lists the fixtures whose byte count changed at that commit, measured the
 same way. A fixture not listed did not move.
@@ -70,6 +70,7 @@ same way. A fixture not listed did not move.
 | 08 | `0e628b2` | gitdiff 20167 -> 3223 |
 | 09 | `1bfdc74` | tsc 13423 -> 4945, server 11446 -> 5950 |
 | 10 | `8347ef4` | none of the ten; a real `curl` capture went 2687 -> 250 |
+| 11 | `618cde4` | api 9139 -> 7267 |
 
 Two rows look backwards because they are correctness fixes. Fix 03 stopped the
 safe fallback from returning the reduction its own verifier had rejected. Before
@@ -100,7 +101,8 @@ a test run is usually in its last lines. Output over 8000 tokens is cut to the
 first half and the last half of that budget, with a marker naming how many
 characters went missing, so the end of the run survives the cap. The split lands
 on a character boundary, never inside a multi-byte character, and the budget is
-counted with the same tokenizer the ratio uses.
+counted with the same tokenizer the ratio uses. That cap is right for a terminal
+transcript and wrong for a JSON body, which fix 11 covers.
 
 ### 03 A rejected reduction is not returned
 
@@ -195,6 +197,30 @@ bytes, the final `100  755k  100  755k ... 28583` frame intact behind
 fixtures in the table, on a `git log --stat`, on `ls -la`, and on a 27KB test
 run, so the stage costs nothing when no progress output is present.
 
+### 11 The cap shrinks arrays instead of slicing machine-readable text
+
+Fix 02's cap assumed the payload was a transcript. On a probe API response it
+held the first and last half of a TOON body, which left text no TOON decoder or
+JSON parser accepts, and the tail it kept had already lost the summary element
+that said how many records went missing: 9139 bytes that decode to nothing and
+do not report their own loss. JSON now answers the cap by dropping whole array
+elements and re-encoding, and any count an earlier stage declared is read back
+out and folded into the new summary, so kept plus declared still equals the
+original length. Terminal output keeps the head and tail cap.
+
+| commit | api.json | orders shown | dropped count declared |
+|---|---:|---|---|
+| `1bfdc74` | 9139 | 98 of 120 | no, the summary was inside the cut |
+| `618cde4` | 7267 | 56 of 120 | yes, `... and 64 more items` |
+
+The row costs 1872 fewer bytes and is the only fixture where the smaller output
+is also the one that reports what it dropped. Dropping the trailing summary
+element breaks the TOON table form, so the kept records print as objects rather
+than as table rows; that is a byte cost this table already counts. Showing fewer
+records than `1bfdc74` is the price of fitting the declared count inside the
+budget: 56 records plus a count of 64 is recoverable, 98 records with the count
+cut away is not.
+
 ## Safe mode refuses SQL migrations on purpose
 
 `migration.sql` measures 0% at every commit in the table, and that is the
@@ -221,7 +247,7 @@ were needed to check the new encodings without weakening the checks:
 
 ## Still open
 
-These are measured gaps the ten fixes did not close. They need a decision about
+These are measured gaps the fixes did not close. They need a decision about
 the host or the protocol, not another pipeline stage.
 
 | gap | why it matters | effort | risk |
