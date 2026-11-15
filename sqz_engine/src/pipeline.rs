@@ -171,6 +171,13 @@ impl CompressionPipeline {
         };
 
         let mut stages_applied: Vec<String> = Vec::new();
+        // Set when identical-change folding replaced repeated hunk bodies with
+        // reference lines. The fold is already the lossy step for that text and
+        // it is verifier-safe: it keeps every path and every `@@` header. A
+        // later entropy pass scores those short reference lines as redundant
+        // and drops half of them, which loses hunk headers the reader needs, so
+        // truncation is skipped once the fold has run.
+        let mut diff_folded = false;
         let mut condensed: Option<(String, String)> = None;
 
         for stage in &self.stages {
@@ -223,6 +230,23 @@ impl CompressionPipeline {
                     content.raw = proj_result.data;
                     stages_applied.push("json_projection".to_owned());
                 }
+            }
+        }
+
+        // Identical-change diff folding: a mechanical refactor repeats one hunk
+        // body across many files. The exemplar stays verbatim and every other
+        // file in the group becomes one reference line carrying its path and
+        // its `@@` headers, so the diff still says where every change landed.
+        // Bodies must be byte-identical (digits included), so nothing is masked
+        // or inferred. Runs before the generic stages so they see the folded
+        // buffer. Skipped on the lossless path.
+        if !lossless && !is_json && content.raw.len() > 400 {
+            if let Ok(Some(fold)) =
+                crate::rle_compressor::collapse_identical_diff_files(&content.raw, 3, 6)
+            {
+                content.raw = fold.text;
+                diff_folded = true;
+                stages_applied.push("diff_fold".to_owned());
             }
         }
 
@@ -327,7 +351,9 @@ impl CompressionPipeline {
         let record_list = content.raw.len() <= RECORD_LIST_MAX_CHARS
             && (stages_applied.iter().any(|s| s == "table_compact")
                 || looks_like_record_list(&content.raw));
-        if !lossless && !is_json && !is_code && !record_list && content.raw.len() > entropy_threshold {
+        if !lossless && !is_json && !is_code && !record_list && !diff_folded
+            && content.raw.len() > entropy_threshold
+        {
             if let Ok(trunc_result) = self.entropy_truncator.truncate_string(&content.raw) {
                 if trunc_result.segments_dropped > 0 {
                     content.raw = trunc_result.text;
@@ -813,6 +839,76 @@ mod tests {
         SessionContext {
             session_id: "test-session".into(),
         }
+    }
+
+    /// Folding must survive the verifier: an agent reading a folded diff still
+    /// needs every path, every hunk header, and the numbers in the body.
+    #[test]
+    fn folded_diff_passes_the_verifier() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n"
+            ));
+        }
+        let out = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(out.stages_applied.iter().any(|s| s == "diff_fold"), "{:?}", out.stages_applied);
+        let verify = crate::verifier::Verifier::verify(&input, &out.data);
+        assert!(
+            verify.passed,
+            "verifier rejected the folded diff: {:?}\n--- output ---\n{}",
+            verify.checks_failed, out.data
+        );
+    }
+
+    /// A diff in which every file carries the same body must fold on the
+    /// normal path, and every file path must survive.
+    #[test]
+    fn diff_fold_stage_fires_on_repeated_bodies() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..8 {
+            input.push_str(&format!(
+                "diff --git a/src/m{i}.rs b/src/m{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/m{i}.rs\n\
+                 +++ b/src/m{i}.rs\n\
+                 @@ -{i}0,8 +{i}0,10 @@ impl M{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n\
+                 -    let x_3 = compute(3);\n\
+                 +    let mut x_3 = compute(3).unwrap_or(3);\n"
+            ));
+        }
+        let result = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(
+            result.stages_applied.iter().any(|s| s == "diff_fold"),
+            "diff_fold did not run; stages: {:?}",
+            result.stages_applied
+        );
+        for i in 0..8 {
+            assert!(
+                result.data.contains(&format!("src/m{i}.rs")),
+                "path m{i} lost: {}",
+                result.data
+            );
+        }
+        assert!(result.data.len() < input.len());
     }
 
     /// Regression for https://github.com/ojuschugh1/sqz/issues/32 — the

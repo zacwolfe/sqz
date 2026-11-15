@@ -515,7 +515,203 @@ pub struct SlidingWindowResult {
     pub tokens_saved: u32,
 }
 
+// ── Identical-change diff folding ────────────────────────────────────────────
+
+/// Result of cross-file diff folding.
+#[derive(Debug, Clone)]
+pub struct DiffFoldResult {
+    pub text: String,
+    /// Files whose body was replaced by a reference line (the exemplar stays).
+    pub files_folded: usize,
+    /// Payload lines removed across those files.
+    pub payload_lines_folded: usize,
+    pub tokens_saved: u32,
+}
+
+/// Fold a git diff in which many files carry the same change.
+///
+/// A mechanical refactor shows up as sixty files with one identical hunk each;
+/// every byte of the payload is repeated, and the only per-file information the
+/// reader needs is where the change landed. This stage keeps the first file
+/// verbatim as the exemplar, then replaces each other file in the group with a
+/// single reference line carrying its path and its `@@` headers.
+///
+/// Safety rules, all required:
+/// - Only a buffer of `diff --git` sections is touched.
+/// - A body is only folded when it is byte-identical to the exemplar's body
+///   (digits included), so no digit is ever masked or inferred.
+/// - The body must be at least `min_payload_lines` lines, so one-line changes
+///   across files are not re-laid-out for nothing.
+/// - The declaration line states how many files were folded and that the body
+///   is shown once.
+/// - Every file path and every `@@` header survives verbatim.
+pub fn collapse_identical_diff_files(
+    text: &str,
+    min_files: usize,
+    min_payload_lines: usize,
+) -> Result<Option<DiffFoldResult>> {
+    let min_files = min_files.max(2);
+    if !text.contains("diff --git ") {
+        return Ok(None);
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("diff --git ") {
+            starts.push(i);
+        }
+    }
+    if starts.len() < min_files {
+        return Ok(None);
+    }
+
+    struct Section<'a> {
+        start: usize,
+        end: usize,
+        path: String,
+        body: Vec<&'a str>,
+        hunks: Vec<&'a str>,
+        unsafe_metadata: bool,
+    }
+
+    let mut sections: Vec<Section> = Vec::with_capacity(starts.len());
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+        let expanded = lines[start..end].join("\n");
+        let path = diff_section_path(&expanded).unwrap_or_else(|| format!("file{}", n));
+        let mut body: Vec<&str> = Vec::new();
+        let mut hunks: Vec<&str> = Vec::new();
+        let mut unsafe_metadata = false;
+        for line in &lines[start..end] {
+            if line.starts_with("@@") {
+                hunks.push(line);
+            } else if is_diff_payload_line(line) {
+                body.push(line);
+            } else if !is_plain_diff_metadata(line) {
+                // Mode changes, renames, copies, and binary patches carry
+                // information that is not in the payload. Folding the section
+                // would drop it, so a group with any such line stays verbatim.
+                unsafe_metadata = true;
+            }
+        }
+        sections.push(Section { start, end, path, body, hunks, unsafe_metadata });
+    }
+
+    // Group section indices by body text, preserving first-appearance order.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (idx, section) in sections.iter().enumerate() {
+        if section.body.len() < min_payload_lines || section.hunks.is_empty() {
+            continue;
+        }
+        if section.unsafe_metadata {
+            continue;
+        }
+        let key = section.body.join("\n");
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(idx),
+            None => groups.push((key, vec![idx])),
+        }
+    }
+
+    let mut folded: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut folded_groups: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (_key, members) in &groups {
+        if members.len() < min_files {
+            continue;
+        }
+        let exemplar = members[0];
+        for &member in &members[1..] {
+            folded.insert(member, exemplar);
+        }
+        folded_groups.insert(exemplar, members.len());
+    }
+
+    if folded.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut files_folded = 0usize;
+    let mut payload_lines_folded = 0usize;
+    for (idx, section) in sections.iter().enumerate() {
+        // Text before the first `diff --git` line is preserved by the caller
+        // path only; sections cover the whole buffer here.
+        if idx == 0 && section.start > 0 {
+            out.extend(lines[..section.start].iter().map(|l| (*l).to_string()));
+        }
+        if folded.contains_key(&idx) {
+            // Both diff path forms (`a/x`, `b/x`) stay so a reader (or a
+            // verification pass) still sees the file as the diff header names
+            // it, and every hunk header is preserved verbatim.
+            out.push(format!(
+                "  a/{} b/{} {}",
+                section.path,
+                section.path,
+                section.hunks.join(" ")
+            ));
+            files_folded += 1;
+            payload_lines_folded += section.body.len();
+            continue;
+        }
+        if let Some(&group) = folded_groups.get(&idx) {
+            out.push(format!(
+                "[identical change: body shown once, {group} files carry it; the rest are \
+                 listed as path + hunk header]"
+            ));
+        }
+        out.extend(lines[section.start..section.end].iter().map(|l| (*l).to_string()));
+    }
+
+    let mut text_out = out.join("\n");
+    if text.ends_with('\n') {
+        text_out.push('\n');
+    }
+    let tokens_saved = ((text.len().saturating_sub(text_out.len())) / 4) as u32;
+    Ok(Some(DiffFoldResult {
+        text: text_out,
+        files_folded,
+        payload_lines_folded,
+        tokens_saved,
+    }))
+}
+
+/// `b/<path>` from a `diff --git a/<path> b/<path>` line.
+fn diff_section_path(section: &str) -> Option<String> {
+    let first = section.lines().next()?;
+    let rest = first.strip_prefix("diff --git ")?;
+    let after_b = rest.rsplit(" b/").next()?;
+    if after_b.is_empty() || after_b == rest {
+        return None;
+    }
+    Some(after_b.to_string())
+}
+
+/// Whether a line belongs to a hunk body rather than to file metadata.
+fn is_diff_payload_line(line: &str) -> bool {
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        return false;
+    }
+    line.starts_with(' ')
+        || line.starts_with('+')
+        || line.starts_with('-')
+        || line.starts_with("\\ ")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Whether a metadata line is one folding may drop without losing meaning.
+///
+/// `diff --git`, `index`, and the `---`/`+++` file markers only name the file,
+/// which the reference line already carries. Anything else (mode changes,
+/// renames, copies, binary patches) changes what the patch does.
+fn is_plain_diff_metadata(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.trim().is_empty()
+}
 
 #[cfg(test)]
 mod tests {
@@ -802,6 +998,99 @@ diff --git a/src/mod_0.rs b/src/mod_0.rs\nindex 0000000..1111111 100644\n@@ -0,7
         let result = collapse_indexed_rows(input, 4).unwrap();
         assert_eq!(result.runs_collapsed, 0);
         assert_eq!(result.text, input);
+    }
+
+    // ── identical-change diff folding ─────────────────────────────────
+
+    fn repeated_diff(files: usize) -> String {
+        let mut out = String::new();
+        for i in 0..files {
+            out.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,4 +{i}0,6 @@ impl Mod{i} {{\n\
+                 -    let x = compute();\n\
+                 +    let mut x = compute().unwrap_or(0);\n\
+                 +    log::trace!(\"x={{x}}\");\n\
+                 -    return x;\n\
+                 +    x\n"
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn diff_folding_keeps_paths_and_hunk_headers() {
+        let input = repeated_diff(6);
+        let result = collapse_identical_diff_files(&input, 3, 4)
+            .unwrap()
+            .expect("identical bodies must fold");
+        assert_eq!(result.files_folded, 5);
+        for i in 0..6 {
+            assert!(
+                result.text.contains(&format!("src/mod_{i}.rs")),
+                "lost path mod_{i}: {}",
+                result.text
+            );
+            assert!(
+                result.text.contains(&format!("@@ -{i}0,4 +{i}0,6 @@ impl Mod{i} {{")),
+                "lost hunk header {i}: {}",
+                result.text
+            );
+        }
+        // The body appears once, with its real digits.
+        assert_eq!(result.text.matches("let mut x = compute().unwrap_or(0);").count(), 1);
+        assert!(result.text.contains("6 files carry it"));
+        assert!(result.text.len() < input.len());
+    }
+
+    #[test]
+    fn diff_folding_needs_identical_bodies() {
+        // Make one body differ by a single digit: numbers are never masked.
+        let input = repeated_diff(3).replacen("unwrap_or(0)", "unwrap_or(7)", 1);
+        let result = collapse_identical_diff_files(&input, 3, 4).unwrap();
+        assert!(result.is_none(), "folded files whose bodies differ");
+    }
+
+    #[test]
+    fn diff_folding_skips_small_groups_and_short_bodies() {
+        let two_files = repeated_diff(2);
+        assert!(collapse_identical_diff_files(&two_files, 3, 4).unwrap().is_none());
+        let long_bodies = repeated_diff(4);
+        assert!(
+            collapse_identical_diff_files(&long_bodies, 3, 99).unwrap().is_none(),
+            "payload shorter than the minimum must not fold"
+        );
+    }
+
+    #[test]
+    fn diff_folding_ignores_non_diff_text() {
+        let log = "line one\nline two\nline three\n";
+        assert!(collapse_identical_diff_files(log, 3, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn diff_folding_refuses_sections_with_mode_or_rename_metadata() {
+        // A mode change or a rename is not part of the payload, so folding the
+        // section would silently drop it. Those groups stay verbatim.
+        let input = repeated_diff(4).replacen(
+            "index abc1..def1 100644",
+            "old mode 100644\nnew mode 100755",
+            1,
+        );
+        let result = collapse_identical_diff_files(&input, 3, 4)
+            .unwrap()
+            .expect("the clean sections still fold");
+        assert!(
+            result.text.contains("new mode 100755"),
+            "mode change lost: {}",
+            result.text
+        );
+        // Three clean files folded (one exemplar, two references); the section
+        // with metadata is untouched.
+        assert_eq!(result.files_folded, 2);
     }
 
     use proptest::prelude::*;

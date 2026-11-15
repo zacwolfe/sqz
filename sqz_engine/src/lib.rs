@@ -148,7 +148,7 @@ pub use image_compressor::{ImageCompressor, ImageDescription};
 pub use json_projection::{project_json, ProjectionConfig, ProjectionResult};
 pub use litm_positioner::{ContextSection, LitmPositioner, LitmStrategy, SectionType};
 pub use ngram_abbreviator::{NgramAbbreviator, AbbreviatorConfig, AbbreviationResult};
-pub use rle_compressor::{rle_compress, sliding_window_dedup, RleResult, SlidingWindowResult};
+pub use rle_compressor::{collapse_identical_diff_files, rle_compress, sliding_window_dedup, DiffFoldResult, RleResult, SlidingWindowResult};
 pub use simhash::{simhash, SimHashFingerprint};
 pub use structural_summary::{summarize as structural_summarize, summarize_multi, SummaryConfig, StructuralSummaryResult};
 pub use textrank::{textrank_compress, TextRankConfig, TextRankResult};

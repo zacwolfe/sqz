@@ -947,6 +947,56 @@ mod tests {
     }
 
     #[test]
+    fn identical_hunks_across_files_fold_and_verify() {
+        use crate::confidence_router::CompressionMode;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db")).unwrap();
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n"
+            ));
+        }
+        assert_ne!(engine.route_compression_mode(&input), CompressionMode::Safe);
+        let result = engine.compress(&input).unwrap();
+        // One exemplar body plus a path/hunk line per file. Before this stage
+        // the diff fell through to entropy truncation, which deleted whole
+        // files from the middle and kept the rest verbatim.
+        assert!(
+            result.stages_applied.iter().any(|s| s == "diff_fold"),
+            "diff_fold did not run: {:?}",
+            result.stages_applied
+        );
+        assert!(result.data.contains("identical change"), "{}", result.data);
+        for i in 0..40 {
+            assert!(
+                result.data.contains(&format!("a/src/mod_{i}.rs b/src/mod_{i}.rs")),
+                "lost file {i}: {}",
+                result.data
+            );
+            assert!(
+                result.data.contains(&format!("@@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{")),
+                "lost hunk header {i}: {}",
+                result.data
+            );
+        }
+        assert_eq!(result.data.matches("let mut x_0 = compute(0).unwrap_or(0);").count(), 1);
+        assert!(result.data.len() * 4 < input.len(), "fold was not honored");
+        assert!(result.verify.as_ref().is_some_and(|v| v.passed));
+        assert_eq!(result.provenance.label.as_deref(), None);
+    }
+
+    #[test]
     fn json_values_survive_every_mode() {
         use crate::confidence_router::CompressionMode;
         let dir = tempfile::tempdir().unwrap();
