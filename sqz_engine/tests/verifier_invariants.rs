@@ -136,3 +136,84 @@ test result: FAILED. 299 passed; 1 failed; 0 ignored
         Verifier::formatter_losses(original, &reindented)
     );
 }
+
+/// A reduction that drops bulk data may ship, but only when it says so. The
+/// declared marker is what separates a summary from a silent loss.
+#[test]
+fn a_declared_omission_licenses_dropping_bulk_data() {
+    let mut original = String::from(
+        "============================= test session starts =============================\n\
+collecting 300 items\n",
+    );
+    for n in 0..300 {
+        original.push_str(&format!(
+            "tests/test_mod_{}.py::test_{n} PASSED [ {:.0}%]\n",
+            n % 20,
+            n as f64 / 3.0
+        ));
+    }
+    original.push_str(
+        "=========================== short test summary info ============================\n\
+FAILED tests/test_db.py::test_read - AssertionError: expected 42 but got 41\n\
+E   AssertionError: expected 42 but got 41 at /repo/tests/test_db.py:42\n",
+    );
+
+    // Same failure signal, 300 rows of bulk data collapsed behind a marker.
+    let mut summarised = String::from(
+        "============================= test session starts =============================\n\
+collecting 300 items\n",
+    );
+    summarised.push_str("tests/test_mod_0.py::test_0 PASSED [ 0%]\n");
+    summarised.push_str("[299 low-information segments omitted]\n");
+    summarised.push_str(
+        "=========================== short test summary info ============================\n\
+FAILED tests/test_db.py::test_read - AssertionError: expected 42 but got 41\n\
+E   AssertionError: expected 42 but got 41 at /repo/tests/test_db.py:42\n",
+    );
+
+    let declared = Verifier::verify(&original, &summarised);
+    assert!(
+        !declared.fallback_triggered,
+        "a declared omission must ship: {:?}",
+        declared.checks_failed
+    );
+
+    // The same output without the marker is a silent loss and must be caught.
+    let undeclared_text = summarised.replace("[299 low-information segments omitted]\n", "");
+    let undeclared = Verifier::verify(&original, &undeclared_text);
+    assert!(
+        undeclared.fallback_triggered,
+        "dropping 299 rows without a marker must fall back"
+    );
+    assert!(
+        undeclared
+            .checks_failed
+            .iter()
+            .any(|(k, _)| k == "file_paths" || k == "preservation"),
+        "the loss must be named: {:?}",
+        undeclared.checks_failed
+    );
+}
+
+/// The omission marker is not a licence to drop the lines that explain the
+/// failure: those must survive even when everything else is summarised.
+#[test]
+fn a_declared_omission_still_requires_signal_lines() {
+    let original = "\
+tests/test_a.py::test_ok PASSED [ 1%]
+tests/test_b.py::test_ok PASSED [ 2%]
+tests/test_db.py:42: in test_read
+    assert value == 42
+AssertionError: expected 42 but got 41
+";
+    let lossy = "\
+tests/test_a.py::test_ok PASSED [ 1%]
+[4 low-information segments omitted]
+";
+    let result = Verifier::verify(original, lossy);
+    assert!(
+        result.fallback_triggered,
+        "a declared omission must not license dropping the assertion: {:?}",
+        result.checks_passed
+    );
+}

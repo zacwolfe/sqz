@@ -18,6 +18,11 @@
 ///    class — the idea (post-compression preservation check) was prompted
 ///    by caveman-compress's validate.py, but the scan mechanism, inputs,
 ///    and integration point are sqz-specific.
+///
+/// Omission rule: content may be dropped only when the output declares it with
+/// a count (`[N segments omitted]`, `[×N similar lines]`, `...+N more`). Under
+/// a declaration, checks 3 and 7 require preservation only of lines that carry
+/// diagnostic signal; without one they require everything.
 
 use crate::text_search;
 use crate::types::VerifyResult;
@@ -33,6 +38,24 @@ impl Verifier {
     pub fn verify(original: &str, compressed: &str) -> VerifyResult {
         let mut passed = Vec::new();
         let mut failed = Vec::new();
+
+        // Omission declaration. A reduction is allowed to drop content only
+        // when the output says it did (`[110 low-information segments
+        // omitted]`, `[... 4000 chars omitted ...]`, `[×119 similar lines]`).
+        // That marker is the difference between a summary and a silent loss:
+        // the reader knows the rest exists and can ask for it. When the marker
+        // is present, the content checks are scoped to the lines that must
+        // survive no matter what (`carries_signal`); when it is absent,
+        // everything the input contained is still required.
+        let declared_omission = declares_omission(compressed);
+        let must_survive: Vec<&str> = if declared_omission {
+            original
+                .lines()
+                .filter(|line| carries_signal(line))
+                .collect()
+        } else {
+            original.lines().collect()
+        };
 
         // Check 1: Content retention (advisory): how much smaller the output is.
         let retention = if original.is_empty() {
@@ -77,8 +100,14 @@ impl Verifier {
         }
 
         // Check 3: File paths preserved (lines containing / or \ with extension)
-        let path_lines: Vec<&str> = original
-            .lines()
+        //
+        // Scoped by `must_survive`: a declared omission may drop the path on a
+        // plain data row (`tests/test_db.py::test_x PASSED`), never the path on
+        // a failure or a `path:line` location — those are how the reader finds
+        // the broken code.
+        let path_lines: Vec<&str> = must_survive
+            .iter()
+            .copied()
             .filter(|l| {
                 (l.contains('/') || l.contains('\\'))
                     && l.chars().any(|c| c == '.')
@@ -190,7 +219,7 @@ impl Verifier {
         //   (`running 300 tests`); demanding those numbers made every cargo
         //   test formatter trip the gate. When the line survived, its numbers
         //   must survive with it.
-        let numbers = numbers_on_surviving_lines(original, compressed);
+        let numbers = numbers_on_surviving_lines(original, compressed, declared_omission);
         if numbers.is_empty() {
             passed.push("numeric_values".to_string());
         } else {
@@ -219,7 +248,16 @@ impl Verifier {
         // into a `§ref:…§` marker intentionally, and (2) the scanner is
         // heuristic and may flag a token that the pipeline legitimately
         // rewrote (e.g. long base64 truncated by entropy_truncate).
-        let preservation_tokens = extract_preservation_tokens(original);
+        //
+        // Scoped the same way as `file_paths`: under a declared omission the
+        // scan covers the surviving signal lines, because the omitted block is
+        // explicitly accounted for by its marker and identifier factsheet.
+        let preservation_source: String = if declared_omission {
+            must_survive.join("\n")
+        } else {
+            original.to_string()
+        };
+        let preservation_tokens = extract_preservation_tokens(&preservation_source);
         if preservation_tokens.is_empty() {
             passed.push("preservation".to_string());
         } else {
@@ -338,6 +376,42 @@ impl Verifier {
     }
 }
 
+/// Whether `compressed` declares that content was dropped.
+///
+/// Only markers sqz itself emits count. Each one names the quantity that went
+/// missing, so a reader can tell "this is a summary of 5840 bytes" from "this
+/// is all 5840 bytes":
+///
+///   - `[110 low-information segments omitted]` (entropy truncator)
+///   - `[... 4000 chars omitted: output exceeded the 8000-token cap ...]`
+///   - `[×119 similar lines folded]` (log template fold)
+///   - `// ... 12 lines omitted ...` / `...+7 more` (list truncation)
+///
+/// Requires the bracket/paren form rather than a bare word, so a compiler
+/// message that happens to contain "truncated" cannot license a silent loss.
+fn declares_omission(compressed: &str) -> bool {
+    for line in compressed.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        let marked = trimmed.starts_with('[')
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("...+")
+            || trimmed.starts_with('…');
+        if !marked {
+            continue;
+        }
+        if lower.contains("omitted")
+            || lower.contains("similar lines")
+            || lower.contains("elided")
+            || lower.contains("lines folded")
+            || lower.contains("chars hidden")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `line` carries diagnostic signal a formatter must not drop.
 ///
 /// Deliberately narrow: failure wording, error/exception markers, and
@@ -439,28 +513,55 @@ fn carries_payload(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Standalone numeric literals on lines the compressed output still carries.
+/// Numeric literals whose loss would mean corruption rather than omission.
 ///
 /// A literal is standalone when the character on either side is not part of an
-/// identifier, so `1200 ms` counts and `req_7f3a9c21` does not. A line counts
-/// as carried when its longest alphabetic token appears in the output; lines
-/// whose distinctive words are gone were dropped whole, and their numbers
-/// went with them by design.
-fn numbers_on_surviving_lines<'a>(original: &'a str, compressed: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
+/// identifier, so `1200 ms` counts and `req_7f3a9c21` does not.
+///
+/// Two scoping rules, chosen by whether the output declares an omission:
+///
+/// - No declaration: a line counts as surviving when its longest alphabetic
+///   token appears in the output. Words intact with numbers gone is exactly the
+///   corruption signature this check exists for (`fetched 3 packages in 1200
+///   ms` → `fetched packages in ms`).
+/// - Declared omission: only signal lines supply required numbers. A token
+///   anchor cannot work on summarised bulk data, because 300 test rows share
+///   the token `tests` and 300 progress bars share `PASSED`, so the anchor
+///   would demand every counter in the block that the declaration just said
+///   was left out. Signal lines must survive any reduction, so their numbers
+///   are always required.
+///
+/// The check is a spot check, not a proof. Stages that re-encode wholesale
+/// (TOON, projection) reformat lines, so containment does not hold and the JSON
+/// key check is what holds them to account.
+fn numbers_on_surviving_lines<'a>(
+    original: &'a str,
+    compressed: &str,
+    declared_omission: bool,
+) -> Vec<&'a str> {
+    const MAX_CHECKED: usize = 10;
+
+    let mut out: Vec<&'a str> = Vec::new();
     for line in original.lines() {
-        if out.len() >= 10 {
-            break;
-        }
-        let Some(anchor) = longest_alpha_token(line) else {
-            continue;
+        let signal = carries_signal(line);
+        let survived = if declared_omission {
+            signal
+        } else {
+            signal
+                || longest_alpha_token(line).is_some_and(|anchor| compressed.contains(anchor))
         };
-        if !compressed.contains(anchor) {
+        if !survived {
             continue;
         }
-        out.extend(standalone_numbers(line));
+        for number in standalone_numbers(line) {
+            if out.len() >= MAX_CHECKED {
+                return out;
+            }
+            if !out.contains(&number) {
+                out.push(number);
+            }
+        }
     }
-    out.truncate(10);
     out
 }
 
