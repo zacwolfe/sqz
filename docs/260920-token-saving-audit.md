@@ -1,10 +1,57 @@
 # sqz token-saving audit
 
 What this document is: the fixes that came out of the 260920 audit of the
-compression pipeline, what each one changed, and what it measured on a fixed
-corpus. Numbers in the tables come from the commands in
-[Measurement](#measurement), run on this machine against the checked-out tree.
-No number here is a projection or a worker report.
+compression pipeline, what each one changed, what it measured on a fixed corpus,
+and the evidence that the shipped binary does what the tables say. Numbers in
+every table come from the commands shown next to them, run on this machine
+against the checked-out tree and against the installed 2.2.0 binary. No number
+here is a projection or a worker report.
+
+## Where the tokens are
+
+The only measured corpus of real traffic is 230 Claude Code transcripts: 24,364
+tool results, 33,253,669 bytes, about 8.3M context tokens, collected on
+2026-09-20. Those raw transcripts are gone, so the shares below are the reason
+the fixes and the open gaps are ordered the way they are. They are not current
+absolutes.
+
+| source | tokens | share | calls | avg per call | sqz can reach it? |
+|---|---:|---:|---:|---:|---|
+| `Bash` | 4,514,780 | 54.3% | 17,247 | 261 | yes, through the hook |
+| built-in `Read` | 2,370,645 | 28.5% | 1,786 | 1,327 | no, it bypasses sqz |
+| other MCP servers | 1,358,809 | 16.3% | n/a | n/a | not unless proxied |
+| sqz's own MCP tools | 69,139 | 0.8% | n/a | n/a | already compressed |
+
+The 28.5% versus 0.8% split is the main coverage problem. `sqz_read_file` exists
+to capture `Read` traffic and is handling almost none of it.
+
+`Read` traffic also repeats heavily: 1,784 calls touched 692 unique paths, so 61%
+were repeat reads. First reads were 1,013,453 tokens and repeat reads 1,336,753.
+A repeat read that returns a `§ref:HASH§` costs about 13 tokens, so the upper
+bound on recoverable tokens is about 1.32M, or 15.9% of context. Those are upper
+bounds: they assume every repeat returned identical bytes and that no client
+behavior limits the saving.
+
+## The tail dominates the average
+
+The local sqz database (`~/.sqz/sessions.db`, 476 logged compressions across 7
+projects between 2026-05-09 and 2026-05-31) shows where savings were being lost.
+
+| bucket | calls | original tokens | compressed tokens | reduction |
+|---|---:|---:|---:|---:|
+| all logged compressions | 476 | 3,879,007 | 3,723,802 | 4.0% |
+| outputs at or below 20k tokens | 471 | 317,671 | 163,526 | 48.5% |
+| outputs above 20k tokens | 5 | 3,561,336 | 3,560,276 | 0.0% |
+
+Five calls produced 92% of the tokens and sqz removed almost none of them. The
+four largest were 1,041,242, 947,983, 771,140, and 770,072 original tokens, all
+from `sed` and `grep` over a 1.3 MB HTML mockup. That output was effectively a
+verbatim copy. The immediate cause was segment granularity: the largest cached
+original has 24 lines and only a trailing double newline, so `split_segments`
+falls back to 10-line groups and produces three segments of 1,075,195, 248,877,
+and 141 bytes. Median entropy is 5.998 bits, so the two large segments survive.
+A 1 MB segment is never subdivided. Fix 02's cap and fix 11's JSON handling
+attack this from the top. The segment splitter itself is unchanged.
 
 ## Measurement
 
@@ -27,7 +74,7 @@ git diff, an `ls -la`, a SQL migration, an `npm install`, a pytest run, a server
 log, and a `tsc` run. Each one is generated to match the real tool's line format
 with indexed identifiers (`dir_0`, `pkg-0`, `test_0`, `Comp0.tsx`), which is what
 makes repeated-row shapes visible and comparable across commits. Total input is
-221,746 bytes. One eleventh fixture is used only by fix 10: a 2687-byte real
+221,746 bytes. An eleventh fixture is used only by fix 10: a 2687-byte real
 capture of a rate-limited `curl` transfer, which carries `\r` redraw frames and
 is the one shape the ten generated fixtures do not have. It is reported in fix
 10's row and is not part of the total.
@@ -135,14 +182,13 @@ instead of being invisible to it.
 `cargo test` prints `test some_name ... ok` per test. The names differ, the rest
 does not, and the earlier template stage could not fold them because it treats
 only timestamps, durations, and percentages as volatile, so `case_0` and `case_1`
-are different lines as far as it is concerned. This
-stage collapses consecutive rows with the same token count that differ in one
-token, or in two tokens that share a non-digit prefix and both end in digits
-(`t_7` next to `col_7`). First and last row stay verbatim, the marker names the
-count and the field that varied, and a run breaks on any signal word, on two
-tokens carrying `/`, `=`, or `|`, on fewer than three distinct values, and on any
-buffer containing a diff header. All of those are reasons a run of rows is not
-the noise it looks like.
+are different lines as far as it is concerned. This stage collapses consecutive
+rows with the same token count that differ in one token, or in two tokens that
+share a non-digit prefix and both end in digits (`t_7` next to `col_7`). First
+and last row stay verbatim, the marker names the count and the field that varied,
+and a run breaks on any signal word, on two tokens carrying `/`, `=`, or `|`, on
+fewer than three distinct values, and on any buffer containing a diff header.
+All of those are reasons a run of rows is not the noise it looks like.
 
 ### 07 Identity-bearing rows outrank byte-entropy filler
 
@@ -221,6 +267,147 @@ records than `1bfdc74` is the price of fitting the declared count inside the
 budget: 56 records plus a count of 64 is recoverable, 98 records with the count
 cut away is not.
 
+## Evidence the fixes are working
+
+Everything below was run against `sqz 2.2.0` built from this tree and installed
+at `~/.cargo/bin/sqz`, with `/usr/local/bin/sqz` symlinked to it, so it measures
+the shipped binary and not a dev-only path. Every command is copy-pasteable.
+
+### The installed binary reproduces the table
+
+```bash
+for f in /tmp/sqzcorpus/{api.json,cargo_test.txt,docker.txt,gitdiff.txt,ls.txt,
+         migration.sql,npm.txt,pytest.txt,server.log,tsc.txt,progress.txt}; do
+  printf '%s dev=%s installed=%s\n' "$(basename $f)" \
+    "$(SQZ_NO_DEDUP=1 ./target/debug/sqz compress --no-cache < $f | wc -c)" \
+    "$(SQZ_NO_DEDUP=1 sqz compress --no-cache < $f | wc -c)"
+done
+```
+
+| fixture | dev tree | installed | table value |
+|---|---:|---:|---:|
+| api.json | 7267 | 7267 | 7267 |
+| cargo_test.txt | 283 | 283 | 283 |
+| docker.txt | 3630 | 3630 | 3630 |
+| gitdiff.txt | 3223 | 3223 | 3223 |
+| ls.txt | 812 | 812 | 812 |
+| migration.sql | 1635 | 1635 | 1635 |
+| npm.txt | 10196 | 10196 | 10196 |
+| pytest.txt | 6998 | 6998 | 6998 |
+| server.log | 5950 | 5950 | 5950 |
+| tsc.txt | 4945 | 4945 | 4945 |
+| progress.txt | 250 | 250 | 250 |
+
+Zero disagreements. The eleven outputs sum to 45,189 bytes: 44,939 for the ten
+fixtures plus 250 for the capture. The ten-fixture total is 79.7% below the
+221,746-byte input and 66.6% below the 89,014 the same corpus measured at
+`fix05`.
+
+### Nothing was dropped without saying so
+
+The reduction is only worth having if the model can tell what is missing. For
+each fixture this compares the distinct indexed identifiers in the input with the
+identifiers in the output, and counts declaration markers in the output.
+
+```bash
+out=$(SQZ_NO_DEDUP=1 sqz compress --no-cache < "$f")
+grep -oE '[A-Za-z_][A-Za-z_0-9]*_[0-9]+' "$f" | sort -u | wc -l
+printf '%s' "$out" | grep -oE '[A-Za-z_][A-Za-z_0-9]*_[0-9]+' | sort -u | wc -l
+printf '%s' "$out" | grep -cE 'omitted|more items|frames\]|template ×|chars omitted'
+```
+
+| fixture | ids in | ids out | declaration markers | verdict |
+|---|---:|---:|---:|---|
+| api.json | 121 | 56 | 1 (`... and 64 more items`) | declares the 64 it dropped |
+| cargo_test.txt | 300 | 2 | 1 (`field 2 spans ... case_299`) | declares 298 rows |
+| docker.txt | 0 | 0 | 2 | template block plus count |
+| gitdiff.txt | 46 | 46 | 0 | nothing dropped, every path kept |
+| ls.txt | 60 | 39 | 1 | declares the omission |
+| migration.sql | 80 | 80 | 0 | safe mode, byte-identical |
+| npm.txt | 0 | 0 | 1 (`20 low-information segments omitted`) | declares |
+| pytest.txt | 320 | 170 | 1 (`15 low-information segments omitted`) | declares |
+| server.log | 0 | 0 | 16 | cap marker plus segment counts |
+| tsc.txt | 0 | 0 | 3 (`[template ×67]`) | layout declared once |
+| progress.txt | 0 | 0 | 1 (`[x32 frames]`) | final frame kept |
+
+No fixture lost identifiers without a marker, and the two fixtures that drop
+nothing (`gitdiff.txt`, `migration.sql`) keep every identifier they had.
+
+### The verifier accepted all of it, and safe mode still refuses risk
+
+```bash
+for f in /tmp/sqzcorpus/*; do
+  SQZ_QUIET=1 SQZ_NO_DEDUP=1 sqz compress --no-cache < "$f" 2>&1 >/dev/null \
+    | grep -c fallback
+done | paste -sd,
+```
+
+Run over all eleven fixtures: `0,0,0,0,0,0,0,0,0,0,0`. No fixture reached the
+lossless fallback, so each reduction above is one the verifier accepted on its
+own terms rather than a rejection that was quietly dropped.
+
+```bash
+SQZ_NO_DEDUP=1 sqz compress --no-cache --lossless < /tmp/sqzcorpus/api.json | wc -c
+SQZ_NO_DEDUP=1 sqz compress --no-cache --lossless < /tmp/sqzcorpus/server.log | wc -c
+```
+
+`--lossless` returns 26533 and 99573 bytes, exactly the inputs, so the gate the
+fixes depend on still holds. `migration.sql` returns its 1635 input bytes under
+`auto`, `safe`, and `aggressive`, and `--mode safe` prints
+`[sqz] mode: safe (preserving all content)` because the router agrees the input
+is DDL.
+
+### Per-fix behaviour, not just byte counts
+
+| fix | command | observed |
+|---|---|---|
+| 01 | `sqz hook claude < hook.json 2>err` | valid JSON on stdout, `err` is 0 bytes, no `[sqz]` banner |
+| 02 | `compress < server.log \| grep chars` | `[... 38653 chars omitted: output exceeded the 4000-token cap; kept first and last halves ...]` |
+| 03 | `compress --no-cache < npm.txt 2>&1 >/dev/null` | no fallback line, so the shipped output is one verification accepted |
+| 04 | `cargo test --workspace` | 1807 passed, 0 failed across 15 test binaries, including the invariant and fallback suites |
+| 05 | `compress < npm.txt \| grep omitted` | `[20 low-information segments omitted]`; pytest prints `[15 low-information segments omitted]` |
+| 06 | `compress < cargo_test.txt \| head -6` | `test tests::case_0 ... ok`, `[×298 rows omitted: field 2 spans "tests::case_0" .. "tests::case_299", all other fields identical]`, `test tests::case_299 ... ok` |
+| 07 | `compress < server.log \| grep -ci error` | 1 in, 1 out: the only error line survives; the 60 filler segments behind it are the declared loss |
+| 08 | `diff <(grep -o 'src/mod_[0-9]*\.rs' gitdiff.txt \| sort -u) <(compress < gitdiff.txt \| grep -o ... \| sort -u)` | no output: all 40 paths survive, 1 exemplar plus 39 reference lines |
+| 09 | `compress < tsc.txt \| head -8` | `[template ×67]` followed by the 67 paths with their `(line,col)` values |
+| 10 | `compress < progress.txt \| tail -3` | final `100  755k  100  755k ... 28583` frame kept, `[x32 frames]` appended |
+| 11 | `compress < api.json \| tail -c 40` | `... and 64 more items` inside a syntactically closed TOON body, so the count survives the cap |
+
+Fix 09's round trip is covered by tests rather than by eye: four tests in
+`sqz_engine/src/template_collapse.rs` assert
+`expand_declared_templates(&folded.text) == input`, and the verifier calls the
+same expansion before checking paths, numbers, and messages.
+
+### Real command output, not only fixtures
+
+Same binary, same flags, three outputs produced by real commands on this machine.
+
+| capture | input bytes | `fix05` | HEAD | notes |
+|---|---:|---:|---:|---|
+| `git log -40 --stat` | 31852 | 21358 | 20174 | all 2 distinct commit shas retained |
+| `ls -la` | 3299 | 3299 | 3040 | passthrough before, compressed now |
+| `git diff --stat HEAD~1 HEAD` | 188 | 188 | 188 | no repeated hunk body, so the fold correctly does not fire |
+
+The third row is the control: a shape the new stages have nothing to say about
+comes back at exactly the same size, which is what "costs nothing when the shape
+is absent" has to mean.
+
+The pressure path is also no longer a no-op. Under an explicit mode,
+`server.log` measures 11878 bytes with `--mode default` and 5906 with
+`--mode aggressive`, so the escalation branch now reaches a different preset
+instead of returning to the same call. Note that explicit-mode numbers differ
+from the stdin table above, which runs the hook path with no `--mode`.
+
+### The failure this series started from is gone
+
+The audit began with a 1.3 MB `sed`/`grep` result that compressed to a verbatim
+copy, 105 bytes removed from 1,324,216. That input is no longer available, but
+the mechanism it exposed is measured above: output over the cap is now cut with a
+declared character count, JSON is shrunk by whole array elements with the count
+of what went missing, and no repair path returns a reduction its own verifier
+rejected. The largest fixture in the corpus, a 99,573-byte server log, goes to
+5950 bytes with 16 declarations and zero fallbacks.
+
 ## Safe mode refuses SQL migrations on purpose
 
 `migration.sql` measures 0% at every commit in the table, and that is the
@@ -229,10 +416,11 @@ starting with `create table`, `alter table`, `drop table`, `create index`, or
 `drop index` routes the whole input to `CompressionMode::Safe`, which returns the
 bytes it was given. A migration is a list of statements where dropping one
 changes what the file does, so no stage runs on it. Verified at HEAD: all three
-modes return the 1635 input bytes unchanged, and the auto route prints
-`safe (preserving all content)`. The fixture stays in the corpus as the guard
-that says so: if a future change starts compressing migrations, this row will
-show it.
+modes return the 1635 input bytes unchanged, and `--mode safe` prints
+`safe (preserving all content)`. Auto mode prints nothing because the banner is
+tty-gated, which is fix 01 doing its job. The fixture stays in the corpus as the
+guard that says so: if a future change starts compressing migrations, this row
+will show it.
 
 ## Verifier changes that made the reductions safe
 
@@ -259,6 +447,7 @@ the host or the protocol, not another pipeline stage.
 | PowerShell and OpenCode skip shell operators | partial coverage on those hosts | S to L | low |
 | JSON projection removes fields with no recovery hint | a stripped `request_id` can force a second call | S | medium |
 | `npx <runner>` and `deno test` miss the test formatter | unquantified | S | low |
+| segment splitter still cannot subdivide a 1 MB segment | the tail case from the original audit is bounded by the cap, not fixed at the source | M | low |
 
 ## Evidence limits
 
@@ -273,9 +462,17 @@ the host or the protocol, not another pipeline stage.
   is a single transfer with no concurrent output, so it does not show how the
   stage handles a bar interleaved with build warnings, and 90% on it is one
   sample, not a distribution.
+- The three real captures in the evidence section are three commands from one
+  repository on one machine. They show the stages do not cost bytes where they
+  have nothing to fold, and they show a real gain, but they are not a
+  distribution either.
 - The original 8.3M-token transcript corpus from 260920 cannot be re-run here.
   Its shares (Bash 54.3%, `Read` 28.5%, other MCP 16.3%) are the reason the open
   gaps above are ordered the way they are, but they are not current absolutes.
 - Byte counts are not token counts. Stages that remove whole rows translate
   almost one to one; stages that rewrite text do not, which is why every claim
   above is in bytes from a real run.
+- The evidence section proves the binary reproduces the table and that each
+  declaration is present. It does not prove a model saves tokens on every run:
+  that needs the hook installed in a live session and the `sqz gain` counters,
+  which measure real traffic, not this corpus.
