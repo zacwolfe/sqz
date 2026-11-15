@@ -304,7 +304,11 @@ impl CompressionPipeline {
         // builds, passing test runs) gets 2x headroom before truncation
         // kicks in, since dropping detail from a success costs more than
         // it saves.
-        let entropy_threshold = if looks_benign(&content.raw) { 1000 } else { 500 };
+        let entropy_threshold = if looks_benign(&content.raw) {
+            preset.compression.benign_entropy_threshold.unwrap_or(1000)
+        } else {
+            preset.compression.entropy_threshold.unwrap_or(500)
+        };
         let record_list = content.raw.len() <= RECORD_LIST_MAX_CHARS
             && (stages_applied.iter().any(|s| s == "table_compact")
                 || looks_like_record_list(&content.raw));
@@ -368,7 +372,11 @@ impl CompressionPipeline {
         };
 
         if !lossless {
-            if let Some(capped) = size_cap::cap_to_tokens(&data, size_cap::DEFAULT_MAX_TOKENS, |s| self.count_tokens(s, preset)) {
+            let max_tokens = preset
+                .compression
+                .max_output_tokens
+                .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
+            if let Some(capped) = size_cap::cap_to_tokens(&data, max_tokens, |s| self.count_tokens(s, preset)) {
                 data = capped;
                 stages_applied.push("size_cap".to_owned());
             }
@@ -757,6 +765,9 @@ mod tests {
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
                 json_projection: None,
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,

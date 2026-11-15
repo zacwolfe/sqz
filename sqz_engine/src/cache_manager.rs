@@ -1077,6 +1077,9 @@ mod tests {
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
                 json_projection: None,
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,

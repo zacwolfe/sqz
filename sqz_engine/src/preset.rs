@@ -163,6 +163,15 @@ pub struct CompressionConfig {
     pub collapse_arrays: Option<CollapseArraysConfig>,
     pub custom_transforms: Option<CustomTransformsConfig>,
     pub json_projection: Option<JsonProjectionConfig>,
+    /// Override the entropy-truncation threshold for non-benign output (bytes).
+    #[serde(default)]
+    pub entropy_threshold: Option<usize>,
+    /// Override the entropy-truncation threshold for benign output (bytes).
+    #[serde(default)]
+    pub benign_entropy_threshold: Option<usize>,
+    /// Override the final output token cap.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// Controls schema-aware JSON projection (strip low-value fields,
@@ -432,6 +441,9 @@ impl Default for Preset {
                     summarize_deep: false,
                     max_depth: 8,
                 }),
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
@@ -470,6 +482,39 @@ impl Default for Preset {
             },
         }
     }
+}
+
+/// Derive an aggressive compression preset from an existing one.
+///
+/// Tightens truncation thresholds and the output cap, and enables the
+/// deepest available lossy reductions. The returned preset keeps every
+/// other setting from `base`.
+pub fn aggressive_preset(base: &Preset) -> Preset {
+    let mut preset = base.clone();
+    preset.preset.name = "aggressive".to_string();
+    preset.preset.description =
+        "Maximum compression: lower truncation thresholds, smaller output cap".to_string();
+
+    preset.compression.entropy_threshold = Some(200);
+    preset.compression.benign_entropy_threshold = Some(500);
+    preset.compression.max_output_tokens = Some(4000);
+
+    if let Some(ref mut t) = preset.compression.truncate_strings {
+        t.max_length = 200;
+    }
+    if let Some(ref mut c) = preset.compression.collapse_arrays {
+        c.max_items = 3;
+    }
+    if let Some(ref mut c) = preset.compression.condense {
+        c.max_repeated_lines = 2;
+    }
+    preset.compression.json_projection = Some(JsonProjectionConfig {
+        enabled: true,
+        summarize_deep: true,
+        max_depth: 4,
+    });
+
+    preset
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +614,9 @@ mod tests {
                     collapse_arrays: None,
                     custom_transforms: None,
                     json_projection: None,
+                    entropy_threshold: None,
+                    benign_entropy_threshold: None,
+                    max_output_tokens: None,
                 },
                 tool_selection,
                 budget,

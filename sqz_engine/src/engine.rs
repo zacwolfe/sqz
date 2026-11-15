@@ -385,7 +385,7 @@ impl SqzEngine {
     ///
     /// - `CompressionMode::Safe` → safe pipeline only (ANSI strip + condense)
     /// - `CompressionMode::Default` → standard pipeline
-    /// - `CompressionMode::Aggressive` → standard pipeline (aggressive preset TBD)
+    /// - `CompressionMode::Aggressive` → aggressive preset, verified, with a safe-mode fallback
     pub fn compress_with_mode(&self, input: &str, mode: crate::confidence_router::CompressionMode) -> Result<CompressedContent> {
         let pipeline = self.pipeline.lock()
             .map_err(|_| SqzError::Other("pipeline lock poisoned".into()))?;
@@ -399,8 +399,30 @@ impl SqzEngine {
                     == crate::confidence_router::CompressionMode::Safe;
                 self.compress_safe(input, &pipeline, &ctx, lossless)
             }
+            crate::confidence_router::CompressionMode::Aggressive => {
+                // High-risk content (secrets, migrations, panic backtraces)
+                // must never be truncated, even in aggressive mode.
+                if self.confidence_router.route(input)
+                    == crate::confidence_router::CompressionMode::Safe
+                {
+                    return self.compress_safe(input, &pipeline, &ctx, true);
+                }
+                let current_preset = self
+                    .preset
+                    .lock()
+                    .map_err(|_| SqzError::Other("preset lock poisoned".into()))?;
+                let aggressive = crate::preset::aggressive_preset(&current_preset);
+                drop(current_preset);
+                let mut result = pipeline.compress(input, &ctx, &aggressive)?;
+                let verify = Verifier::verify(input, &result.data);
+                if verify.fallback_triggered {
+                    return self.compress_safe(input, &pipeline, &ctx, false);
+                }
+                result.verify = Some(verify);
+                Ok(result)
+            }
             _ => {
-                // Default and Aggressive: run normal pipeline + verify
+                // Default: run normal pipeline + verify
                 drop(pipeline); // release lock before calling compress()
                 self.compress(input)
             }
@@ -438,6 +460,9 @@ impl SqzEngine {
                 collapse_arrays: None,
                 custom_transforms: Some(CustomTransformsConfig { enabled: false }),
                 json_projection: None,
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
