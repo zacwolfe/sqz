@@ -490,7 +490,15 @@ impl SqzEngine {
         } else {
             pipeline.compress(input, ctx, &safe_preset)?
         };
-        let verify = Verifier::verify(input, &result.data);
+        let mut verify = Verifier::verify(input, &result.data);
+        // A lossy "safe" retry that its own verifier rejects is not safe: it is
+        // the same data loss with a safer label. Fall back to the lossless path
+        // so the caller gets the bytes it passed in (modulo ANSI stripping)
+        // instead of a second unreliable compression.
+        if !lossless && verify.fallback_triggered {
+            result = pipeline.compress_lossless(input, ctx, &safe_preset)?;
+            verify = Verifier::verify(input, &result.data);
+        }
         result.verify = Some(verify);
         result.provenance = Provenance {
             label: Some("safe-fallback".to_string()),
@@ -854,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_still_compresses() {
+    fn verifier_fallback_returns_lossless_instead_of_a_rejected_reduction() {
         use crate::confidence_router::CompressionMode;
         let dir = tempfile::tempdir().unwrap();
         let engine = SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db")).unwrap();
@@ -871,7 +879,12 @@ mod tests {
         assert_ne!(engine.route_compression_mode(&input), CompressionMode::Safe);
         let result = engine.compress(&input).unwrap();
         assert_eq!(result.provenance.label.as_deref(), Some("safe-fallback"));
-        assert!(result.data.contains("low-information segments omitted"), "{}", result.data);
+        // The truncated candidate dropped file paths, which is what the
+        // verifier flagged. Returning it anyway is the circular fallback this
+        // fix removes: the retry has to hand back the bytes it was given.
+        assert_eq!(result.data, input);
+        assert!(!result.data.contains("low-information segments omitted"));
+        assert!(result.verify.as_ref().is_some_and(|v| v.passed));
         assert_eq!(result.data, engine.compress_with_mode(&input, CompressionMode::Safe).unwrap().data);
     }
 

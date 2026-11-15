@@ -193,6 +193,18 @@ pub fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, Option<String>> {
 
 const NET_WIN_MIN_TOKENS: u32 = 16;
 
+/// Stack-trace payload the router classifies as high-risk (Safe route).
+const STACK_TRACE_FIXTURE: &str = "\
+thread 'main' panicked at src/db.rs:42:9:
+connection refused
+stack backtrace:
+   0: rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: sqz_engine::db::connect
+   3: sqz_engine::main
+password=hunter2
+";
+
 /// Outputs this long dwarf a ref and its note, so the ref gate skips counting them.
 const REF_GATE_MAX_BYTES: usize = 1024;
 
@@ -205,6 +217,20 @@ fn only_trailing_space_differs(output: &str, formatted: &str) -> bool {
             .len();
     formatted == output
         || (output.len() - body.len() < 8 && punct <= 8 && formatted.trim_end() == body)
+}
+
+/// Whether a formatter's output may stand in for `output`.
+///
+/// Formatters drop lines by design (transfer progress, install logs, duplicate
+/// status lines), so on the Safe route a formatter is a lossy transform and has
+/// to clear the same verifier the pipeline uses. When verification fails the
+/// caller shows the raw output instead of the formatted reduction. Other routes
+/// keep the historical behaviour: the formatter is the intended transform.
+fn formatter_output_verified(engine: &SqzEngine, output: &str, formatted: &str) -> bool {
+    if engine.route_compression_mode(output) != sqz_engine::CompressionMode::Safe {
+        return true;
+    }
+    !sqz_engine::Verifier::verify(output, formatted).fallback_triggered
 }
 
 pub struct CliProxy {
@@ -376,6 +402,14 @@ impl CliProxy {
                 None => (formatted, false),
             };
             let tokens_compressed = self.engine.count_tokens(&formatted);
+            if !formatter_output_verified(&self.engine, output, &formatted) {
+                if !quiet() {
+                    eprintln!(
+                        "[sqz] formatter bypassed for '{cmd}': verification failed, showing raw output"
+                    );
+                }
+                return output.to_owned();
+            }
             if tokens_original.saturating_sub(tokens_compressed) >= NET_WIN_MIN_TOKENS || cap_hit {
                 // Persist to L2 cache — but skip if content contains secrets
                 let never_store = self.engine.never_store(output);
@@ -831,6 +865,60 @@ mod tests {
         (CliProxy::with_engine(engine), dir)
     }
 
+    /// A formatter that drops needed detail on the Safe route is a lossy
+    /// transform the pipeline would never be allowed to make. The gate has to
+    /// reject it so `intercept_output` shows the raw output instead.
+    #[test]
+    fn formatter_gate_rejects_lossy_output_on_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let mut output = String::from("thread 'main' panicked at src/db.rs:42:9:\nstack backtrace:\n");
+        for i in 0..40 {
+            output.push_str(&format!("    {}: app::module_{}::call at /repo/src/mod_{}.rs:{}\n", i, i, i, i));
+        }
+        output.push_str("password=hunter2\n");
+        assert_eq!(
+            proxy.engine.route_compression_mode(&output),
+            sqz_engine::CompressionMode::Safe,
+            "payload must route Safe for this test to mean anything"
+        );
+
+        let lossy = "build finished: ok\n";
+        assert!(
+            !formatter_output_verified(&proxy.engine, &output, lossy),
+            "gate accepted a formatter output the verifier rejects"
+        );
+        // Dropping the payload entirely is the extreme case of the same thing.
+        assert!(!formatter_output_verified(&proxy.engine, &output, ""));
+    }
+
+    /// A formatter that keeps the payload intact loses nothing, so the gate
+    /// must let it through and the route keeps its savings.
+    #[test]
+    fn formatter_gate_allows_faithful_output_on_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let output = STACK_TRACE_FIXTURE;
+        assert_eq!(
+            proxy.engine.route_compression_mode(output),
+            sqz_engine::CompressionMode::Safe
+        );
+        let formatted = output.replace("   ", "  ");
+        assert!(formatter_output_verified(&proxy.engine, output, &formatted));
+        assert!(formatter_output_verified(&proxy.engine, output, output));
+    }
+
+    /// Outside Safe the formatter *is* the intended transform, so the gate must
+    /// not add a second, stricter policy there.
+    #[test]
+    fn formatter_gate_is_noop_outside_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let output = "test result: ok. 42 passed; 0 failed; 0 ignored\n";
+        assert_ne!(
+            proxy.engine.route_compression_mode(output),
+            sqz_engine::CompressionMode::Safe
+        );
+        assert!(formatter_output_verified(&proxy.engine, output, "tests: 42 passed\n"));
+    }
+
     #[test]
     fn test_patterns_count() {
         assert!(
@@ -1052,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_output_keeps_its_spill_ref() {
+    fn verifier_fallback_returns_the_input_instead_of_a_rejected_reduction() {
         let (proxy, _dir) = isolated_proxy();
         let output = (0..24)
             .map(|i| {
@@ -1066,10 +1154,13 @@ mod tests {
             .join("\n\n");
         let fallback = proxy.engine.compress(&output).unwrap();
         assert_eq!(fallback.provenance.label.as_deref(), Some("safe-fallback"));
+        // The lossy candidate dropped file paths, so verification failed. The
+        // fallback must not hand that reduction back: it returns the input.
+        assert_eq!(fallback.data, output, "fallback returned a rejected reduction");
+        assert!(!fallback.data.contains("low-information segments omitted"));
         let result = proxy.intercept_output("tail app.log", &output);
-        let hash = sqz_engine::CacheManager::sha256_hex(output.as_bytes());
-        assert!(result.ends_with(&format!("[full output: sqz expand {}]", &hash[..16])), "{result}");
-        assert!(result.contains("low-information segments omitted"), "{result}");
+        assert_eq!(result, output, "intercept_output returned a rejected reduction");
+        assert!(!result.contains("low-information segments omitted"), "{result}");
     }
 
     fn api_response_json() -> String {
@@ -1484,3 +1575,4 @@ mod tests {
         }
     }
 }
+
