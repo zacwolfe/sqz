@@ -237,6 +237,215 @@ fn is_volatile(token: &str) -> bool {
     false
 }
 
+// ── Indexed-row compaction ───────────────────────────────────────────────────
+
+/// Result of indexed-row compaction.
+#[derive(Debug, Clone)]
+pub struct IndexedRowResult {
+    pub text: String,
+    pub runs_collapsed: usize,
+    pub rows_collapsed: usize,
+    pub tokens_saved: u32,
+}
+
+/// Collapse consecutive rows that differ only in an index or name field.
+///
+/// [`log_template_collapse`] masks timestamps, durations, and percentages, so
+/// `test tests::case_0 ... ok` and `test tests::case_1 ... ok` never share a
+/// template and three hundred such rows survive verbatim. This stage handles
+/// that shape: rows with the same token count that differ in one token, or in
+/// two tokens that share a non-digit prefix and both end in digits (`t_7`
+/// alongside `col_7`, and still true for `t_12` alongside `col_12`).
+///
+/// Safety rules, all required:
+/// - First and last row of a run stay verbatim, so the reader sees where the
+///   run starts and where it ends.
+/// - The marker names how many rows went missing and which field varied, so
+///   the loss is declared rather than silent.
+/// - A line containing a signal word (error, panic, failed, assert, ...) is
+///   never collapsed and breaks the run, so a run cannot swallow a failure.
+/// - Diff payload never collapses: `diff --git`, `@@`, or `+++`/`---` anywhere
+///   in the buffer disables the stage, because in a diff the changed lines are
+///   the content.
+/// - A run needs at least three distinct values, so two rows flapping between
+///   two names do not become a "range".
+/// - Differing tokens carrying `/`, `=`, or `|` block the run: that is a path,
+///   an assignment, or a table cell, not an index.
+pub fn collapse_indexed_rows(text: &str, min_run_length: usize) -> Result<IndexedRowResult> {
+    let identity = || IndexedRowResult {
+        text: text.to_string(),
+        runs_collapsed: 0,
+        rows_collapsed: 0,
+        tokens_saved: 0,
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let min_run_length = min_run_length.max(3);
+    if lines.len() < min_run_length {
+        return Ok(identity());
+    }
+    if lines.iter().any(|line| {
+        line.starts_with("diff --git")
+            || line.starts_with("@@")
+            || line.starts_with("+++ ")
+            || line.starts_with("--- ")
+    }) {
+        return Ok(identity());
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut runs_collapsed = 0usize;
+    let mut rows_collapsed = 0usize;
+    let mut tokens_saved = 0u32;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let mut end = i + 1;
+        if !is_signal_row(lines[i]) {
+            while end < lines.len()
+                && !is_signal_row(lines[end])
+                && lines[end] != lines[i]
+                && compatible_rows(lines[i], lines[end])
+            {
+                end += 1;
+            }
+        }
+
+        let run_len = end - i;
+        let omitted = run_len.saturating_sub(2);
+        if run_len >= min_run_length
+            && omitted > 0
+            && distinct_varying_values(&lines[i..end]) >= 3
+        {
+            let (field, first_value, _) = row_difference(lines[i], lines[i + 1]);
+            let (_, _, last_value) = row_difference(lines[i], lines[end - 1]);
+            output.push(lines[i].to_string());
+            output.push(format!(
+                "[×{omitted} rows omitted: {field} spans \"{first_value}\" .. \"{last_value}\", all other fields identical]"
+            ));
+            output.push(lines[end - 1].to_string());
+            runs_collapsed += 1;
+            rows_collapsed += omitted;
+            for line in &lines[i + 1..end - 1] {
+                tokens_saved += (line.len() as u32).div_ceil(4);
+            }
+            i = end;
+        } else {
+            output.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+
+    let trailing_newline = text.ends_with('\n');
+    let mut result = output.join("\n");
+    if trailing_newline && !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    Ok(IndexedRowResult {
+        text: result,
+        runs_collapsed,
+        rows_collapsed,
+        tokens_saved,
+    })
+}
+
+const INDEXED_SIGNAL_WORDS: [&str; 11] = [
+    "error",
+    "warning",
+    "fatal",
+    "panic",
+    "exception",
+    "failed",
+    "failure",
+    "assert",
+    "traceback",
+    "backtrace",
+    "stack trace",
+];
+
+fn is_signal_row(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    INDEXED_SIGNAL_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// Trailing run of ASCII digits in `token` (empty when it has none).
+fn trailing_digits(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    let mut start = bytes.len();
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    &token[start..]
+}
+
+/// The part of `token` before its trailing digit run, and that digit run.
+fn split_trailing_digits(token: &str) -> (&str, &str) {
+    let digits = trailing_digits(token);
+    (&token[..token.len() - digits.len()], digits)
+}
+
+/// Whether two rows differ only in an index or name field.
+fn compatible_rows(a: &str, b: &str) -> bool {
+    let left: Vec<&str> = a.split_whitespace().collect();
+    let right: Vec<&str> = b.split_whitespace().collect();
+    if left.len() != right.len() || left.is_empty() {
+        return false;
+    }
+    let differing: Vec<usize> = (0..left.len()).filter(|&k| left[k] != right[k]).collect();
+    if differing.is_empty() || differing.len() > 2 {
+        return false;
+    }
+    for &k in &differing {
+        let barred = |token: &str| token.contains('/') || token.contains('=') || token.contains('|');
+        if barred(left[k]) || barred(right[k]) {
+            return false;
+        }
+    }
+    if differing.len() == 2 {
+        for &k in &differing {
+            let (left_prefix, left_digits) = split_trailing_digits(left[k]);
+            let (right_prefix, right_digits) = split_trailing_digits(right[k]);
+            if left_digits.is_empty()
+                || right_digits.is_empty()
+                || left_prefix != right_prefix
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `(field label, first row's value, second row's value)` for the first
+/// differing token of two rows.
+fn row_difference(a: &str, b: &str) -> (String, String, String) {
+    let left: Vec<&str> = a.split_whitespace().collect();
+    let right: Vec<&str> = b.split_whitespace().collect();
+    match (0..left.len().min(right.len())).find(|&k| left[k] != right[k]) {
+        Some(k) => (
+            format!("field {}", k + 1),
+            left[k].to_string(),
+            right[k].to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    }
+}
+
+/// How many distinct values the varying field takes across a run.
+fn distinct_varying_values(rows: &[&str]) -> usize {
+    let mut seen: Vec<String> = Vec::new();
+    for pair in rows.windows(2) {
+        let (_, first, second) = row_difference(pair[0], pair[1]);
+        for value in [first, second] {
+            if !value.is_empty() && !seen.iter().any(|known| known == &value) {
+                seen.push(value);
+            }
+        }
+    }
+    seen.len()
+}
+
 // ── Sliding Window Dedup ──────────────────────────────────────────────────────
 
 /// Token-level sliding window deduplication.
@@ -502,6 +711,97 @@ done\n";
     fn test_sliding_window_empty_input() {
         let result = sliding_window_dedup("", 3).unwrap();
         assert_eq!(result.text, "");
+    }
+
+    // ── indexed-row compaction ────────────────────────────────────────
+
+    fn cargo_rows(count: usize) -> String {
+        (0..count)
+            .map(|n| format!("test tests::case_{n} ... ok\n"))
+            .collect()
+    }
+
+    #[test]
+    fn indexed_rows_collapse_a_passing_test_run() {
+        let input = cargo_rows(300);
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 298);
+        assert_eq!(result.text.lines().count(), 3, "first row, marker, last row");
+        assert!(result.text.contains("test tests::case_0 ... ok"));
+        assert!(result.text.contains("test tests::case_299 ... ok"));
+        assert!(
+            result.text.contains("[×298 rows omitted: field 2 spans \"tests::case_0\" .. \"tests::case_299\""),
+            "marker declares the loss and the varying field: {}",
+            result.text
+        );
+        assert!(!result.text.contains("case_150"));
+    }
+
+    #[test]
+    fn indexed_rows_never_swallow_a_failing_row() {
+        let mut input = cargo_rows(300);
+        input = input.replace(
+            "test tests::case_150 ... ok\n",
+            "test tests::case_150 ... FAILED\n",
+        );
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert!(
+            result.text.contains("test tests::case_150 ... FAILED"),
+            "failing row must survive verbatim: {}",
+            result.text
+        );
+        // The run is split around the failure, so nothing between the two halves
+        // is dropped across it.
+        for n in [149usize, 151] {
+            assert!(
+                result.text.contains(&format!("case_{n}")),
+                "row {} sits at the run edge and must survive",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_rows_leave_short_runs_alone() {
+        let input = cargo_rows(3);
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn indexed_rows_leave_multi_field_changes_alone() {
+        let input = "\
+node_0 has alpha beta gamma
+node_1 has delta epsilon zeta
+node_2 has eta theta iota
+node_3 has kappa lambda mu
+";
+        let result = collapse_indexed_rows(input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0, "four varying fields are content");
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn indexed_rows_collapse_aligned_double_index_rows() {
+        let input: String = (0..40)
+            .map(|n| format!("ALTER TABLE t_{n} ADD COLUMN col_{n} TEXT;\n"))
+            .collect();
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 38);
+        assert!(result.text.contains("ALTER TABLE t_0 ADD COLUMN col_0 TEXT;"));
+        assert!(result.text.contains("ALTER TABLE t_39 ADD COLUMN col_39 TEXT;"));
+    }
+
+    #[test]
+    fn indexed_rows_never_touch_diff_payload() {
+        let input = "\
+diff --git a/src/mod_0.rs b/src/mod_0.rs\nindex 0000000..1111111 100644\n@@ -0,7 +0,9 @@\n";
+        let result = collapse_indexed_rows(input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
     }
 
     use proptest::prelude::*;

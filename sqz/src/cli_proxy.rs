@@ -1499,11 +1499,15 @@ mod tests {
         let (proxy, _dir) = isolated_proxy();
         let sha = unique_sha();
 
+        // Two non-index tokens per line (module name and layer word) so the
+        // indexed-row compaction stage does not fold these rows: it fires on
+        // rows that differ in one token, or in two that both end in digits.
+        // This test is about the abbreviator, not about row folding.
         let output = format!(
-            "Resolving dependencies for revision {sha} in module-a\n\
-             Resolving dependencies for revision {sha} in module-b\n\
-             Resolving dependencies for revision {sha} in module-c\n\
-             Resolving dependencies for revision {sha} in module-d\n"
+            "Resolving dependencies for revision {sha} in module-a (layer one)\n\
+             Resolving dependencies for revision {sha} in module-b (layer two)\n\
+             Resolving dependencies for revision {sha} in module-c (layer three)\n\
+             Resolving dependencies for revision {sha} in module-d (layer four)\n"
         );
 
         let opts = InterceptOptions { no_cache: false, abbreviate: false, ..InterceptOptions::default() };
@@ -1542,10 +1546,14 @@ mod tests {
         // what the abbreviator should fold.
         let tag = unique_sha();
         let phrase = format!("recurring diagnostic phrase with extra words {tag} marker");
-        // Enough repetitions that abbreviation clears the net-win gate.
-        let output: String = (0..12)
-            .map(|i| format!("{phrase} occurrence number {i}\n"))
-            .collect();
+        // Enough repetitions that abbreviation clears the net-win gate. A
+        // distinct line between repetitions keeps the indexed-row stage from
+        // folding the block first, which is what this test is not about.
+        let mut output = String::new();
+        for i in 0..12 {
+            output.push_str(&format!("{phrase} during step {i}\n"));
+            output.push_str(&format!("trailing note {i} for a different writer\n"));
+        }
 
         // Explicit default — abbreviation enabled.
         let opts = InterceptOptions::default();
@@ -1591,4 +1599,3 @@ mod tests {
         }
     }
 }
-

@@ -212,6 +212,14 @@ impl CacheManager {
     /// Register a stored entry in the similarity index. Capped so a very
     /// long session can't grow the index unboundedly; beyond the cap the
     /// recent-LRU fallback in [`Self::try_delta_encode`] still applies.
+    ///
+    /// The index stores the RAW document, because lookups are made with raw
+    /// documents: `try_delta_encode` queries with the incoming text. Indexing
+    /// the compressed form instead made both sides disagree as soon as a stage
+    /// rewrote the text — a collapse of forty rows to three lines drops the
+    /// stored document's similarity to its own raw twin below the 0.5 cutoff,
+    /// so a genuinely near-duplicate re-read came back `Fresh` and paid full
+    /// price.
     fn index_for_similarity(&self, hash: &str, data: &str) {
         const MAX_INDEXED: usize = 512;
         let mut hashes = self.lsh_hashes.borrow_mut();
@@ -426,13 +434,18 @@ impl CacheManager {
         // Near-duplicate check: compare against recent cache entries
         let text = String::from_utf8_lossy(content).into_owned();
         let _ = self.store.record_cache_miss().map_err(|e| eprintln!("[sqz] cache miss record error: {e}"));
-        if let Some(delta_result) = self.try_delta_encode(&text)? {
-            // Store the new content in cache for future exact matches
-            let compressed = compress(&text)?;
+        // Compress first, then diff. The cached entry holds the compressed
+        // form, and the delta is only ever shown *instead of* a compressed
+        // form, so both sides of the diff have to be post-pipeline. Diffing
+        // raw-against-compressed scored ~0.0 similarity as soon as a stage
+        // rewrote the text and silently disabled delta encoding for exactly
+        // the large outputs it saves the most on.
+        let compressed = compress(&text)?;
+        if let Some(delta_result) = self.try_delta_encode(&text, &compressed.data)? {
             // Persist the raw bytes so `sqz expand <prefix>` can round-trip.
             self.store
                 .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
-            self.index_for_similarity(&hash, &compressed.data);
+            self.index_for_similarity(&hash, &text);
             self.record_ref_sent(&hash);
 
             let token_cost = (delta_result.delta_text.len() / 4) as u32;
@@ -443,10 +456,9 @@ impl CacheManager {
             });
         }
 
-        let compressed = compress(&text)?;
         self.store
             .save_cache_entry_with_original(&hash, &compressed, Some(content))?;
-        self.index_for_similarity(&hash, &compressed.data);
+        self.index_for_similarity(&hash, &text);
         // Record that this content was sent at the current turn
         self.record_ref_sent(&hash);
 
@@ -462,17 +474,21 @@ impl CacheManager {
     ///    estimated Jaccard similarity and the best 5 are tried.
     /// 2. Fallback: the 10 most recent LRU entries (covers content stored
     ///    before this process built its in-memory index).
+    ///
+    /// `new_raw` drives candidate lookup (the index holds raw documents);
+    /// `new_compressed` is what the diff is actually computed against.
     fn try_delta_encode(
         &self,
-        new_content: &str,
+        new_raw: &str,
+        new_compressed: &str,
     ) -> Result<Option<crate::delta_encoder::DeltaResult>> {
         // LSH path.
         let candidates: Vec<String> = {
             let lsh = self.lsh.borrow();
             let hashes = self.lsh_hashes.borrow();
-            let query_sig = crate::minhash_lsh::MinHashLsh::compute_signature(new_content);
+            let query_sig = crate::minhash_lsh::MinHashLsh::compute_signature(new_raw);
             let mut scored: Vec<(f64, &String)> = lsh
-                .query(new_content)
+                .query(new_raw)
                 .into_iter()
                 .filter_map(|doc_id| {
                     let hash = hashes.get(doc_id as usize)?;
@@ -484,7 +500,7 @@ impl CacheManager {
             scored.into_iter().take(5).map(|(_, h)| h.clone()).collect()
         };
         for hash in &candidates {
-            if let Some(delta) = self.try_delta_against(hash, new_content)? {
+            if let Some(delta) = self.try_delta_against(hash, new_raw, new_compressed)? {
                 return Ok(Some(delta));
             }
         }
@@ -496,7 +512,7 @@ impl CacheManager {
             if candidates.iter().any(|c| c == hash) {
                 continue;
             }
-            if let Some(delta) = self.try_delta_against(hash, new_content)? {
+            if let Some(delta) = self.try_delta_against(hash, new_raw, new_compressed)? {
                 return Ok(Some(delta));
             }
         }
@@ -504,16 +520,39 @@ impl CacheManager {
         Ok(None)
     }
 
+    /// Diff `new` against one cached entry, cheapest rendering first.
+    ///
+    /// Both sides of the diff are normally post-pipeline, because the entry
+    /// stores the compressed form and that is what the model was shown. A
+    /// stage that rewrites text (row collapsing, log templating) can react
+    /// differently to a small edit — one changed word splits a run and the
+    /// compressed forms stop resembling each other — so on a miss this falls
+    /// back to diffing the stored original bytes against the new raw text.
+    /// The delta then describes raw lines, which is what `sqz expand`
+    /// round-trips to anyway.
     fn try_delta_against(
         &self,
         hash: &str,
-        new_content: &str,
+        new_raw: &str,
+        new_compressed: &str,
     ) -> Result<Option<crate::delta_encoder::DeltaResult>> {
-        if let Some(cached) = self.store.get_cache_entry(hash)? {
-            let hash_prefix = &hash[..hash.len().min(16)];
-            if let Ok(Some(delta)) = self.delta_encoder.encode(&cached.data, new_content, hash_prefix) {
-                if delta.delta_text.len() < new_content.len() {
-                    return Ok(Some(delta));
+        let Some(cached) = self.store.get_cache_entry(hash)? else {
+            return Ok(None);
+        };
+        let hash_prefix = &hash[..hash.len().min(16)];
+        if let Ok(Some(delta)) = self.delta_encoder.encode(&cached.data, new_compressed, hash_prefix)
+        {
+            if delta.delta_text.len() < new_compressed.len() {
+                return Ok(Some(delta));
+            }
+        }
+        if let Some(original) = self.store.get_cache_entry_original(hash)? {
+            let original = String::from_utf8_lossy(&original);
+            if original != new_raw {
+                if let Ok(Some(delta)) = self.delta_encoder.encode(&original, new_raw, hash_prefix) {
+                    if delta.delta_text.len() < new_compressed.len() {
+                        return Ok(Some(delta));
+                    }
                 }
             }
         }
@@ -624,7 +663,7 @@ impl CacheManager {
         let hash = Self::sha256_hex(original_content);
         self.store
             .save_cache_entry_with_original(&hash, compressed, Some(original_content))?;
-        self.index_for_similarity(&hash, &compressed.data);
+        self.index_for_similarity(&hash, &String::from_utf8_lossy(original_content));
         self.record_ref_sent(&hash);
         Ok(())
     }
@@ -1181,6 +1220,53 @@ mod tests {
             }
             _ => panic!("expected CacheResult::Fresh on a cold read"),
         }
+    }
+
+    /// The similarity index must hold the raw document, not the compressed
+    /// one. When a stage collapses forty numbered rows to three lines, the
+    /// stored document stops resembling the raw text that a later read
+    /// arrives with, so indexing the compressed form answered `Fresh` for a
+    /// genuine near-duplicate and paid full price.
+    #[test]
+    fn near_duplicate_survives_a_row_collapsing_stage() {
+        let (store, _dir) = in_memory_store();
+        let cm = CacheManager::new(store, u64::MAX);
+        let pipeline = make_pipeline();
+
+        let base: String = (0..40)
+            .map(|i| format!("stable log line number {i} with steady content here\n"))
+            .collect();
+        match cm
+            .get_or_compress(Path::new("base"), base.as_bytes(), &pipeline)
+            .unwrap()
+        {
+            CacheResult::Fresh { output } => assert!(
+                output.data.contains("rows omitted"),
+                "fixture must exercise the collapsing stage: {}",
+                output.data
+            ),
+            _ => panic!("expected Fresh on a cold read"),
+        }
+
+        for n in 0..12 {
+            let filler: String = (0..30)
+                .map(|i| format!("filler doc {n} row {i} totally different subject matter\n"))
+                .collect();
+            cm.get_or_compress(Path::new("filler"), filler.as_bytes(), &pipeline)
+                .unwrap();
+        }
+
+        let variant = base.replace(
+            "stable log line number 7 with steady content here",
+            "stable log line number 7 with taken apart content here",
+        );
+        let result = cm
+            .get_or_compress(Path::new("variant"), variant.as_bytes(), &pipeline)
+            .unwrap();
+        assert!(
+            !matches!(result, CacheResult::Fresh { .. }),
+            "near-duplicate of a collapsed document must still resolve"
+        );
     }
 
     /// MinHash LSH finds a near-duplicate even after 12 unrelated entries

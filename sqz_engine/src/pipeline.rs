@@ -266,6 +266,21 @@ impl CompressionPipeline {
             }
         }
 
+        // Indexed-row compaction: collapse runs of rows that differ only in an
+        // index or name field (test-runner rows, generated migrations, repeated
+        // statements). log_template only masks timestamps, so these rows never
+        // share a template and survive verbatim. The marker names the count and
+        // which field varied, so the loss is declared. Diff payload and signal
+        // lines are excluded inside the stage. Skipped on the lossless path.
+        if !lossless && !is_json && !is_code && content.raw.len() > 200 {
+            if let Ok(ir_result) = crate::rle_compressor::collapse_indexed_rows(&content.raw, 4) {
+                if ir_result.runs_collapsed > 0 {
+                    content.raw = ir_result.text;
+                    stages_applied.push("indexed_row_collapse".to_owned());
+                }
+            }
+        }
+
         // Sliding window dedup: catch repeated substrings across non-adjacent lines.
         // Skipped on the lossless path — its `[→Ln]` back-references have no
         // agent-facing expand path and make a file read non-faithful (#32).
