@@ -797,7 +797,7 @@ done\n";
         let result = collapse_indexed_rows(&input, 4).unwrap();
         assert_eq!(result.runs_collapsed, 1);
         assert_eq!(result.rows_collapsed, 298);
-        assert!(result.text.contains("[×298 rows omitted: field 1 spans \"test case 1 ... ok\" .. \"test case 300 ... ok\", all other fields identical]"));
+        assert!(result.text.contains("[×298 rows omitted: field 3 spans \"1\" .. \"300\", all other fields identical]"));
     }
 
     #[test]
