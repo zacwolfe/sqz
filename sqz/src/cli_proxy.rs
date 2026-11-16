@@ -344,7 +344,7 @@ impl CliProxy {
                     if !quiet() {
                         eprintln!("{note}");
                     }
-                    self.maybe_log_rerun_regret(cmd, &hit);
+                    self.maybe_log_rerun_regret(cmd, &hit, output);
                     self.log_dedup_hit(cmd, output);
                     return hit.inline_ref;
                 }
@@ -361,7 +361,7 @@ impl CliProxy {
                     if !quiet() {
                         eprintln!("{note}");
                     }
-                    self.maybe_log_rerun_regret(cmd, &hit);
+                    self.maybe_log_rerun_regret(cmd, &hit, output);
                     self.log_dedup_hit(cmd, output);
                     return hit.inline_ref;
                 }
@@ -576,7 +576,28 @@ impl CliProxy {
     /// bought nothing, which usually means the compressed first serving
     /// was missing something. Window defaults to 120s; override with
     /// `SQZ_REGRET_WINDOW_SECS` (0 disables).
-    fn maybe_log_rerun_regret(&self, cmd: &str, hit: &sqz_engine::DedupHit) {
+    ///
+    /// Only a hit that actually withheld a materially larger payload counts:
+    /// an empty or tiny repeat served as a ref says nothing about whether
+    /// compression dropped information. Noise labels (`true`, `false`, `:`,
+    /// empty) are skipped for the same reason.
+    fn maybe_log_rerun_regret(
+        &self,
+        cmd: &str,
+        hit: &sqz_engine::DedupHit,
+        output: &str,
+    ) {
+        // A bare no-op label carries no command identity; a "regret" there is
+        // an artefact of the caller, not a real lossy-compression signal.
+        if sqz_engine::session_store::normalize_mode_label(cmd) == sqz_engine::session_store::NOOP_LABEL {
+            return;
+        }
+        // The ref token costs ~13 tokens; if the body was no larger than that
+        // plus the net-win margin there was nothing meaningful to withhold.
+        const DEDUP_REF_TOKENS: u32 = 13;
+        if self.engine.count_tokens(output) <= DEDUP_REF_TOKENS + NET_WIN_MIN_TOKENS {
+            return;
+        }
         const DEFAULT_WINDOW_SECS: f64 = 120.0;
         let window = std::env::var("SQZ_REGRET_WINDOW_SECS")
             .ok()
@@ -588,10 +609,15 @@ impl CliProxy {
         let Some(prev) = hit.prev_accessed_at else { return };
         let gap = (chrono::Utc::now() - prev).num_milliseconds() as f64 / 1000.0;
         if gap >= 0.0 && gap <= window {
-            let _ = self
-                .engine
-                .session_store()
-                .log_regret("rerun", cmd, &hit.hash, gap);
+            // One regret per (cmd, hash) per window, even when the caller
+            // re-runs in a tight loop.
+            let _ = self.engine.session_store().log_regret_deduped(
+                "rerun",
+                sqz_engine::session_store::normalize_mode_label(cmd),
+                &hit.hash,
+                gap,
+                window,
+            );
         }
     }
 
@@ -1096,6 +1122,116 @@ mod tests {
         assert!(stats.avg_rerun_gap_secs < 120.0);
         let top = store.regret_by_command(5).unwrap();
         assert_eq!(top[0].0, "git log");
+    }
+
+    /// A genuinely large repeat is the only signal rerun-regret exists to
+    /// capture: the payload was materially bigger than the ref token, so the
+    /// agent re-producing it means the ref withheld something it needed. Even
+    /// when the caller re-runs in a tight loop, that is one regret, not three.
+    #[test]
+    fn repeated_large_rerun_logs_exactly_one_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "large-rerun-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "large rerun content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be stored in the dedup cache and make the ref pay off\n"
+                .repeat(40),
+        );
+        // Comfortably above the ref cost plus the net-win margin, so this is
+        // a real withheld payload rather than a noise repeat.
+        assert!(
+            proxy.engine.count_tokens(&output) > 13 + NET_WIN_MIN_TOKENS,
+            "fixture must be large enough to qualify as a genuine regret"
+        );
+
+        let store = proxy.engine.session_store();
+        for attempt in 0..3 {
+            let result = proxy.intercept_output("git log", &output);
+            if attempt > 0 {
+                assert!(
+                    result.starts_with("§ref:"),
+                    "attempt {attempt} should be served as a dedup ref, got: {result}"
+                );
+            }
+            let reruns = store.regret_stats().unwrap().reruns;
+            assert_eq!(
+                reruns,
+                u32::from(attempt > 0),
+                "attempt {attempt}: exactly one rerun signal for one withheld payload"
+            );
+        }
+        assert_eq!(
+            store.regret_by_command(5).unwrap()[0].0,
+            "git log",
+            "the regret must be attributed to the real command label"
+        );
+    }
+
+    #[test]
+    fn noop_label_does_not_produce_rerun_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "noop-regret-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "noop test content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be withheld as a ref\n".repeat(5),
+        );
+
+        proxy.intercept_output("true", &output);
+        let second = proxy.intercept_output("true", &output);
+        assert!(second.starts_with("§ref:"), "expected dedup ref, got: {second}");
+        assert_eq!(
+            proxy.engine.session_store().regret_stats().unwrap().reruns,
+            0,
+            "a bare `true` label must not be scored as rerun regret"
+        );
+
+        // The stats row is recorded under the dedicated non-command label.
+        let breakdown = proxy.engine.session_store().per_command_breakdown().unwrap();
+        assert!(
+            breakdown.iter().any(|(mode, ..)| mode == "noop"),
+            "expected a noop row, got {breakdown:?}"
+        );
+        assert!(
+            !breakdown.iter().any(|(mode, ..)| mode == "true"),
+            "`true` must never be recorded as a command label"
+        );
+    }
+
+    #[test]
+    fn no_dedup_run_logs_no_rerun_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "no-dedup-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "no dedup content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be withheld as a ref\n".repeat(5),
+        );
+        let opts = InterceptOptions {
+            no_cache: true,
+            abbreviate: false,
+            ..InterceptOptions::default()
+        };
+        proxy.intercept_output_with_options("git log", &output, opts);
+        proxy.intercept_output_with_options("git log", &output, opts);
+        assert_eq!(
+            proxy.engine.session_store().regret_stats().unwrap().reruns,
+            0,
+            "no dedup hit means no rerun regret"
+        );
     }
 
     #[test]

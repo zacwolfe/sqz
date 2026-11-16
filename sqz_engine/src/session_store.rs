@@ -1090,6 +1090,34 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Like [`log_regret`](Self::log_regret), but skips the insert when an
+    /// identical `(kind, cmd, hash)` row was already written within
+    /// `dedupe_secs`. Repeated reruns of the same content in a tight loop
+    /// describe one regret, not N.
+    pub fn log_regret_deduped(
+        &self,
+        kind: &str,
+        cmd: &str,
+        hash: &str,
+        gap_secs: f64,
+        dedupe_secs: f64,
+    ) -> Result<()> {
+        let cutoff = (Utc::now()
+            - chrono::Duration::milliseconds((dedupe_secs * 1000.0) as i64))
+        .to_rfc3339();
+        let exists = self
+            .db
+            .prepare(
+                "SELECT 1 FROM regret_log WHERE kind = ?1 AND cmd = ?2 AND hash = ?3 AND created_at >= ?4 LIMIT 1",
+            )?
+            .query_row(params![kind, cmd, hash, cutoff], |_| Ok(()))
+            .is_ok();
+        if exists {
+            return Ok(());
+        }
+        self.log_regret(kind, cmd, hash, gap_secs)
+    }
+
     /// Aggregate regret counts for `sqz stats`.
     pub fn regret_stats(&self) -> Result<RegretStats> {
         let mut stmt = self.db.prepare(
@@ -1977,6 +2005,16 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(modes, vec!["cargo test", "noop", "dedup"]);
+    }
+
+    #[test]
+    fn deduped_regret_logs_one_row_per_window() {
+        let store = in_memory_store();
+        store.log_regret_deduped("rerun", "git log", "abc", 5.0, 120.0).unwrap();
+        store.log_regret_deduped("rerun", "git log", "abc", 6.0, 120.0).unwrap();
+        // A different hash is a distinct regret.
+        store.log_regret_deduped("rerun", "git log", "def", 7.0, 120.0).unwrap();
+        assert_eq!(store.regret_stats().unwrap().reruns, 2);
     }
 
     #[test]
