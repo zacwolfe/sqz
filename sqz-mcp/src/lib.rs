@@ -287,13 +287,19 @@ impl McpServer {
 
     /// Log a compression event to the session store so `sqz gain` and
     /// `sqz stats` reflect MCP-path savings.
-    fn log_compression(&self, tool_id: &str, tokens_original: u32, tokens_compressed: u32) {
+    fn log_compression(
+        &self,
+        tool_id: &str,
+        tokens_original: u32,
+        tokens_compressed: u32,
+        stages: &[String],
+    ) {
         let project = std::env::current_dir().ok();
         let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
         let _ = self.engine.session_store().log_compression_with_project(
             tokens_original,
             tokens_compressed,
-            &[],
+            stages,
             tool_id,
             project_str.as_deref(),
         );
@@ -316,18 +322,21 @@ impl McpServer {
 
         let compressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let tokens_original = self.engine.count_tokens(&raw_input);
-            self.compress_cached(&raw_input, tokens_original, false, true)
-                .map(|(output, tokens_compressed)| (output, tokens_original, tokens_compressed))
+            self.compress_cached(&raw_input, tokens_original, false, true).map(
+                |(output, tokens_compressed, stages)| {
+                    (output, tokens_original, tokens_compressed, stages)
+                },
+            )
         }));
-        let (output, tokens_original, tokens_compressed) = match compressed {
+        let (output, tokens_original, tokens_compressed, stages) = match compressed {
             Ok(result) => result?,
             Err(_) => {
                 self.engine.clear_poison();
                 let tokens = estimate_tokens(&raw_input);
-                (raw_input, tokens, tokens)
+                (raw_input, tokens, tokens, Vec::new())
             }
         };
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         Ok(ToolCallResponse {
             tool_id: request.tool_id,
@@ -506,7 +515,7 @@ impl McpServer {
     /// Repeat reads got pipeline compression (~30%), not dedup refs
     /// (~92%). Routing through `engine.compress_with_cache()` restores
     /// the advertised behaviour.
-    fn compress_cached(&self, text: &str, tokens: u32, lossless: bool, allow_delta: bool) -> Result<(String, u32)> {
+    fn compress_cached(&self, text: &str, tokens: u32, lossless: bool, allow_delta: bool) -> Result<(String, u32, Vec<String>)> {
         use sqz_engine::CacheResult;
         #[cfg(test)]
         tests::maybe_panic();
@@ -519,33 +528,38 @@ impl McpServer {
         };
         let tiny = tokens <= REF_TOKENS;
         Ok(match result {
-            CacheResult::Dedup { inline_ref, token_cost } if !tiny => (inline_ref, token_cost),
-            CacheResult::Delta { delta_text, token_cost, .. } if allow_delta && !tiny => (delta_text, token_cost),
+            CacheResult::Dedup { inline_ref, token_cost } if !tiny => {
+                (inline_ref, token_cost, vec!["dedup".to_string()])
+            }
+            CacheResult::Delta { delta_text, token_cost, .. } if allow_delta && !tiny => {
+                (delta_text, token_cost, vec!["delta".to_string()])
+            }
             CacheResult::Dedup { .. } | CacheResult::Delta { .. } => return self.compress_fresh(text, lossless),
             CacheResult::Fresh { output } => {
-                let lossy = output.stages_applied.iter().any(|s| s == "entropy_truncate" || s == "toon_encode");
+                let stages = output.stages_applied;
+                let lossy = stages.iter().any(|s| s == "entropy_truncate" || s == "toon_encode");
                 if lossy && !self.engine.never_store(text) {
                     let hash = sqz_engine::CacheManager::sha256_hex(text.as_bytes());
                     let data = format!("{}\n[full output: call expand with prefix \"{}\"]", output.data, &hash[..16]);
                     match self.engine.count_tokens(&data) {
-                        cost if cost < tokens => (data, cost),
-                        _ => (text.to_string(), tokens),
+                        cost if cost < tokens => (data, cost, stages),
+                        _ => (text.to_string(), tokens, Vec::new()),
                     }
                 } else {
-                    (output.data, output.tokens_compressed)
+                    (output.data, output.tokens_compressed, stages)
                 }
             }
         })
     }
 
     /// What `compress_cached` returns on a cache miss, without the cache.
-    fn compress_fresh(&self, text: &str, lossless: bool) -> Result<(String, u32)> {
+    fn compress_fresh(&self, text: &str, lossless: bool) -> Result<(String, u32, Vec<String>)> {
         let output = if lossless {
             self.engine.compress_lossless(text)?
         } else {
             self.engine.compress(text)?
         };
-        Ok((output.data, output.tokens_compressed))
+        Ok((output.data, output.tokens_compressed, output.stages_applied))
     }
 
     /// Read a file from disk and return the content compressed.
@@ -662,7 +676,7 @@ impl McpServer {
         };
 
         let tokens_original = self.engine.count_tokens(&raw_text);
-        let (compressed_data, tokens_compressed) =
+        let (compressed_data, tokens_compressed, stages) =
             self.compress_cached(&raw_text, tokens_original, true, range.is_none())?;
 
         // Attach a small header so the agent knows where the content
@@ -683,7 +697,7 @@ impl McpServer {
         }
         let output = format!("{header}]\n{compressed_data}");
 
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         Ok(ToolCallResponse {
             tool_id: request.tool_id,
@@ -732,8 +746,8 @@ impl McpServer {
 
         let raw = listing.lines.join("\n");
         let tokens_original = self.engine.count_tokens(&raw);
-        let (compressed_data, tokens_compressed) = self.compress_cached(&raw, tokens_original, true, true)?;
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        let (compressed_data, tokens_compressed, stages) = self.compress_cached(&raw, tokens_original, true, true)?;
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         let mut header = format!(
             "[sqz_list_dir path={} entries={}",
@@ -825,8 +839,8 @@ impl McpServer {
 
         let raw = found.lines.join("\n");
         let tokens_original = self.engine.count_tokens(&raw);
-        let (compressed_data, tokens_compressed) = self.compress_cached(&raw, tokens_original, true, true)?;
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        let (compressed_data, tokens_compressed, stages) = self.compress_cached(&raw, tokens_original, true, true)?;
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         let mut header = format!(
             "[sqz_grep pattern={:?} root={} matches={}",

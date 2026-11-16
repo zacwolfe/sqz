@@ -444,10 +444,15 @@ impl CliProxy {
                 if cap_hit && !never_store {
                     let hash = sqz_engine::CacheManager::sha256_hex(output.as_bytes());
                     let shown = format!("{shown}\n[full output: sqz expand {}]", &hash[..16]);
-                    self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                    self.log_compression(
+                        cmd,
+                        tokens_original,
+                        self.engine.count_tokens(&shown),
+                        &["size_cap".to_string()],
+                    );
                     return shown;
                 }
-                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown), &[]);
                 return shown;
             }
         }
@@ -539,7 +544,12 @@ impl CliProxy {
                 }
 
                 let shown = if safe { abbreviated } else { self.apply_context_refs(&abbreviated) };
-                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                self.log_compression(
+                    cmd,
+                    tokens_original,
+                    self.engine.count_tokens(&shown),
+                    &compressed.stages_applied,
+                );
                 shown
             }
             Err(e) => {
@@ -595,7 +605,7 @@ impl CliProxy {
     ///   while compression saved none), so skip it.
     ///
     /// The session-DB stats logging below always runs, regardless.
-    fn log_compression(&self, cmd: &str, original: u32, compressed: u32) {
+    fn log_compression(&self, cmd: &str, original: u32, compressed: u32, stages: &[String]) {
         let saved = original.saturating_sub(compressed);
         let pct = if original > 0 { (saved as f64 / original as f64 * 100.0) as u32 } else { 0 };
         if !quiet() && pct > 0 {
@@ -604,7 +614,7 @@ impl CliProxy {
         let project = std::env::current_dir().ok();
         let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
         let _ = self.engine.session_store().log_compression_with_project(
-            original, compressed, &[], cmd,
+            original, compressed, stages, cmd,
             project_str.as_deref(),
         );
         #[cfg(debug_assertions)]

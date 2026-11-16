@@ -364,10 +364,15 @@ impl SqzEngine {
             self.compress(text).ok().map(|output| CacheResult::Fresh { output })
         }?;
 
-        let (out, tokens_compressed, repeat) = match result {
-            CacheResult::Dedup { inline_ref, token_cost } => (inline_ref, token_cost, true),
-            CacheResult::Delta { delta_text, token_cost, .. } => (delta_text, token_cost, true),
+        let (out, tokens_compressed, repeat, stages) = match result {
+            CacheResult::Dedup { inline_ref, token_cost } => {
+                (inline_ref, token_cost, true, vec!["dedup".to_string()])
+            }
+            CacheResult::Delta { delta_text, token_cost, .. } => {
+                (delta_text, token_cost, true, vec!["delta".to_string()])
+            }
             CacheResult::Fresh { output } => {
+                let stages = output.stages_applied;
                 // First pass is lossy, so point at the cached original.
                 let mut data = output.data;
                 if use_cache {
@@ -378,7 +383,7 @@ impl SqzEngine {
                     ));
                 }
                 let t = chars_over_four(&data);
-                (data, t, false)
+                (data, t, false, stages)
             }
         };
         if tokens_original.saturating_sub(tokens_compressed) < TOOL_RESULT_MIN_SAVING {
@@ -389,6 +394,7 @@ impl SqzEngine {
             tokens_original,
             tokens_compressed,
             repeat,
+            stages,
         })
     }
 
@@ -755,6 +761,9 @@ pub struct ToolResultCompression {
     /// A ref or delta against content already sent: lossless. Otherwise a
     /// first-pass compression, which is lossy.
     pub repeat: bool,
+    /// Pipeline stages that produced the output (`["dedup"]`/`["delta"]`
+    /// for cache hits). Recorded in `compression_log.stages_applied`.
+    pub stages: Vec<String>,
 }
 
 fn chars_over_four(text: &str) -> u32 {
