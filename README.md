@@ -670,6 +670,16 @@ The over-80k column is a few dozen bytes above the explicit aggressive column be
 
 Two consequences worth knowing. First, the escalation means a long session compresses harder than a fresh one, so benchmark numbers only compare when the database state matches; `--mode default` pins the weaker mode and `--mode aggressive` pins the stronger one, both bypassing the pressure check. Second, `~/.sqz/presets` does not enter into it: the CLI and the hook use the preset compiled into the binary.
 
+A hands-off install never passes `--mode`: the rewritten command is `sqz compress --cmd '<command>'` and nothing else, so hook traffic is always auto. To pin a mode for one task, write the pipe yourself. Both hooks then stand down, `sqz hook claude` echoing the command unchanged and `sqz hook claude-post` returning no replacement for its result, because both skip a command containing `sqz compress`. Measured with the release binary and `tsc.txt`: the wrapped command's result came back as written (0-byte hook reply), while the same result from an unwrapped command was replaced with a 5,459-byte version.
+
+```sh
+cat api.json | sqz compress --mode aggressive
+```
+
+Force it when you want the shape of a payload and none of the individual values, which is the case the default pass preserves. On api.json the default pass returns all 120 `ord_` records in 10,979 bytes, aggressive returns 56 of them followed by a literal `"... and 64 more items"` in 7,224 bytes. Use it for API dumps, repeated rows and log floods you will only skim, and keep the default for anything you will count, diff, parse or copy values out of, since the rows it drops are not in the store to expand.
+
+Reading back which mode ran is harder than it should be, because the two paths log differently: an explicit `--mode aggressive` writes `aggressive` into `compression_log.mode`, while the auto path writes the command label there (`stdin` for a bare pipe). The dependable signals are the stderr lines, `[sqz] mode: aggressive (maximum reduction)` for the flag and `[sqz] adaptive: high session pressure (...) tokens/30min, escalating compression` for an escalation, and the `[full output: sqz expand <prefix>]` trailer, which the auto path adds and aggressive does not. The pressure count itself is global: it sums every project that shares `~/.sqz/sessions.db`, so one busy project escalates the rest of them until the window expires. Give a project its own `SQZ_DB_PATH` when its compression behaviour has to stay independent of the others.
+
 One JSON-specific lever: nested objects keep their values by default, and `SQZ_JSON_SUMMARIZE_DEEP=1` replaces them with `{"...": "N keys"}` once they pass `SQZ_JSON_MAX_DEPTH` (default 12). On api.json, depth 2 takes it to 1,750 bytes and deletes every nested value.
 
 ### Leave the output cap alone
