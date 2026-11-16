@@ -4,13 +4,17 @@
 /// - 90+ CLI patterns registered (Requirement 1.2)
 /// - 18+ tree-sitter grammars loaded (Requirement 19.1)
 /// - Default preset is valid (Requirement 24.2)
-/// - SqzEngine::new() succeeds without network requests (Requirements 23.1, 16.1)
+/// - An isolated SqzEngine succeeds without network requests (Requirements 23.1, 16.1)
 #[cfg(test)]
 mod smoke_tests {
     use sqz_engine::{AstParser, SqzEngine};
     use sqz_engine::preset::{Preset, PresetParser};
 
-    /// Binary is operational: SqzEngine::new() succeeds.
+    /// Binary is operational: an isolated SqzEngine succeeds.
+    ///
+    /// The store is a per-test tempdir, never `SqzEngine::new()`'s default
+    /// `~/.sqz/sessions.db` — tests must not append rows to real user stats.
+    ///
     /// No network requests are made (offline operation, Requirement 23.1).
     #[test]
     fn test_engine_initialises_without_network() {

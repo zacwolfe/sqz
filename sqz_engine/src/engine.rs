@@ -67,27 +67,48 @@ impl SqzEngine {
     /// prefer absolute paths when hooks may run from subdirectories.
     /// Otherwise `~/.sqz/sessions.db`, falling back to a temp-file path
     /// if the home dir is unavailable.
+    ///
+    /// Under `cfg(test)` (unit tests in this crate) the home directory is
+    /// never used: a unique temp-file path is returned instead. Tests should
+    /// still prefer [`with_preset_and_store`](Self::with_preset_and_store)
+    /// with a `tempfile::TempDir`; this is a backstop so a stray
+    /// `SqzEngine::new()` can never append rows to a developer's real
+    /// `~/.sqz/sessions.db`.
     pub fn default_store_path() -> std::path::PathBuf {
         if let Some(custom) = Self::store_path_from_env(std::env::var("SQZ_DB_PATH").ok()) {
             return custom;
         }
-        if let Some(home) = dirs_next::home_dir() {
-            let sqz_dir = home.join(".sqz");
-            if std::fs::create_dir_all(&sqz_dir).is_ok() {
-                // Harden permissions on Unix: ~/.sqz/ contains session data
-                // and cached content that may include sensitive output.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &sqz_dir,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
-                }
-                return sqz_dir.join("sessions.db");
-            }
+        #[cfg(test)]
+        {
+            return Self::temp_store_path();
         }
-        // Fallback: temp dir with unique name
+        #[cfg(not(test))]
+        {
+            if let Some(home) = dirs_next::home_dir() {
+                let sqz_dir = home.join(".sqz");
+                if std::fs::create_dir_all(&sqz_dir).is_ok() {
+                    // Harden permissions on Unix: ~/.sqz/ contains session data
+                    // and cached content that may include sensitive output.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &sqz_dir,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    return sqz_dir.join("sessions.db");
+                }
+            }
+            Self::temp_store_path()
+        }
+    }
+
+    /// A unique, process-scoped temp-file store path.
+    ///
+    /// Used as the fallback when the home directory is unavailable, and as
+    /// the test-build default so unit tests never touch `~/.sqz`.
+    fn temp_store_path() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
         dir.join(format!(
             "sqz_session_{}_{}.db",
@@ -1237,5 +1258,38 @@ complexity_threshold = 0.4
         assert!(db.exists(), "database file must land at the custom path");
         let stats = engine.session_store().compression_stats().unwrap();
         assert_eq!(stats.total_compressions, 1);
+    }
+
+    /// Regression: unit tests must never resolve the default store into the
+    /// developer's real `~/.sqz/sessions.db`. Historically property tests
+    /// called `SqzEngine::new()` and appended rows to the live stats DB,
+    /// polluting `sqz stats` with fixture output. Under `cfg(test)` the
+    /// default must be a temp path, and the previously leaking constructor
+    /// must still open it successfully.
+    #[test]
+    fn default_store_path_never_targets_real_home_under_test() {
+        if SqzEngine::store_path_from_env(std::env::var("SQZ_DB_PATH").ok()).is_some() {
+            // The caller pinned a DB explicitly; nothing to guard.
+            return;
+        }
+
+        let resolved = SqzEngine::default_store_path();
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "test-build default store must live under the temp dir, got {}",
+            resolved.display()
+        );
+        if let Some(home) = dirs_next::home_dir() {
+            assert!(
+                !resolved.starts_with(home.join(".sqz")),
+                "test-build default store must not live under {}, got {}",
+                home.display(),
+                resolved.display()
+            );
+        }
+
+        // The previously leaking constructor resolves through the same path.
+        let engine = SqzEngine::new().expect("engine init on the test default path");
+        drop(engine);
     }
 }
