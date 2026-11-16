@@ -108,8 +108,9 @@ sqz pipeline:
 
 - **`sqz_grep`** — search files for a literal string or regex.
   **PREFER this over the built-in `Grep`** for anything that might
-  match more than a handful of lines. Caps at 200 matches by default;
-  raise with `max_matches` if needed.
+  match more than a handful of lines. Caps at 200 matches by default.
+  When the header says `truncated=true`, page with `offset=<next_offset>`
+  instead of raising `max_matches`.
 
 - **`sqz_list_dir`** — list a directory. Skips `.git`, `node_modules`,
   `target`, `dist`, `build`, `vendor`, `__pycache__` so the output
