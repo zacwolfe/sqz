@@ -665,6 +665,13 @@ impl CacheManager {
             .save_cache_entry_with_original(&hash, compressed, Some(original_content))?;
         self.index_for_similarity(&hash, &String::from_utf8_lossy(original_content));
         self.record_ref_sent(&hash);
+        // Enforce the cache budget on the write path. The entry just stored
+        // has the newest `accessed_at`, so it is evicted last; pinned entries
+        // are never candidates. Best-effort: a failed sweep must not fail the
+        // compression that already succeeded.
+        if let Err(e) = self.evict_lru() {
+            eprintln!("[sqz] cache eviction error: {e}");
+        }
         Ok(())
     }
 
@@ -757,12 +764,25 @@ impl CacheManager {
     /// Evict least-recently-used entries until total cache size is at or below
     /// `max_size_bytes`.
     ///
+    /// Budget policy:
+    /// - Total size counts the real stored bytes of every entry: the JSON
+    ///   `data` column plus the raw `original` blob (pinned entries included).
+    /// - Only unpinned entries are eviction candidates. Pinned content is
+    ///   exempt by design (see `sqz pin`), so eviction can never delete it.
+    /// - If the pinned entries alone exceed the budget, eviction removes every
+    ///   unpinned entry and stops. The cap is then unmet; that is reported
+    ///   honestly by returning the bytes actually freed rather than looping.
+    ///
     /// Returns the number of bytes freed.
     pub fn evict_lru(&self) -> Result<u64> {
-        let entries = self.store.list_cache_entries_lru()?;
-
-        // Compute current total size.
-        let total: u64 = entries.iter().map(|(_, sz)| sz).sum();
+        // Total budget accounting includes pinned entries, so the budget is
+        // enforced against real storage, not just the evictable subset.
+        let total: u64 = self
+            .store
+            .list_cache_entries_lru()?
+            .iter()
+            .map(|(_, sz)| sz)
+            .sum();
         if total <= self.max_size_bytes {
             return Ok(0);
         }
@@ -770,13 +790,13 @@ impl CacheManager {
         let mut freed: u64 = 0;
         let mut remaining = total;
 
-        for (hash, size) in &entries {
+        for (hash, size) in self.store.list_evictable_cache_entries_lru()? {
             if remaining <= self.max_size_bytes {
                 break;
             }
-            self.store.delete_cache_entry(hash)?;
+            self.store.delete_cache_entry(&hash)?;
             freed += size;
-            remaining -= size;
+            remaining = remaining.saturating_sub(size);
         }
 
         Ok(freed)
@@ -1379,6 +1399,83 @@ mod tests {
 
         let freed = cm.evict_lru().unwrap();
         assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn evict_lru_preserves_pinned_entries() {
+        fn entry(tag: &str) -> crate::types::CompressedContent {
+            crate::types::CompressedContent {
+                data: format!("compressed-{tag}"),
+                tokens_compressed: 3,
+                tokens_original: 100,
+                stages_applied: vec![],
+                compression_ratio: 0.1,
+                provenance: Default::default(),
+                verify: None,
+            }
+        }
+
+        let (store, _dir) = in_memory_store();
+        let original_a = vec![b'a'; 400];
+        let original_b = vec![b'b'; 400];
+        let original_c = vec![b'c'; 400];
+
+        store
+            .save_cache_entry_with_original("hash-a", &entry("a"), Some(&original_a))
+            .unwrap();
+        store.pin_cache_entry("hash-a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store
+            .save_cache_entry_with_original("hash-b", &entry("b"), Some(&original_b))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store
+            .save_cache_entry_with_original("hash-c", &entry("c"), Some(&original_c))
+            .unwrap();
+
+        // Sizes come from the row-accounting query (data + original bytes).
+        let entries = store.list_cache_entries_lru().unwrap();
+        let size_of = |hash: &str| {
+            entries
+                .iter()
+                .find(|(h, _)| h == hash)
+                .unwrap_or_else(|| panic!("missing {hash}"))
+                .1
+        };
+        let total: u64 = entries.iter().map(|(_, size)| size).sum();
+        let pinned_size = size_of("hash-a");
+        // Pinned entry alone fits; pinned + one unpinned does not.
+        let budget = pinned_size + size_of("hash-b") / 2;
+        assert!(pinned_size < budget, "pinned entry must fit on its own");
+        assert!(total > budget, "seed entries must exceed the budget");
+
+        let cm = CacheManager::new(store, budget);
+        let freed = cm.evict_lru().unwrap();
+
+        assert!(freed > 0, "expected unpinned entries to be evicted");
+        assert!(
+            cm.store.cache_entry_exists("hash-a").unwrap(),
+            "pinned entry must survive eviction"
+        );
+        assert!(!cm.store.cache_entry_exists("hash-b").unwrap());
+        assert!(!cm.store.cache_entry_exists("hash-c").unwrap());
+
+        let remaining: u64 = cm
+            .store
+            .list_cache_entries_lru()
+            .unwrap()
+            .iter()
+            .map(|(_, size)| size)
+            .sum();
+        assert_eq!(remaining, pinned_size, "only the pinned entry should remain");
+        assert!(remaining <= budget, "budget must be enforced");
+
+        // Eviction candidates never include pinned rows.
+        let evictable = cm.store.list_evictable_cache_entries_lru().unwrap();
+        assert!(
+            evictable.iter().all(|(hash, _)| hash != "hash-a"),
+            "pinned entry must not be an eviction candidate"
+        );
     }
 
     #[test]
