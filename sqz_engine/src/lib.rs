@@ -229,10 +229,10 @@ pub use terse_mode::TerseMode;
 pub use token_counter::TokenCounter;
 pub use types::*;
 pub use preset::{
-    BudgetConfig, CollapseArraysConfig, CompressionConfig, CondenseConfig, CustomTransformsConfig,
-    FlattenConfig, GitDiffFoldConfig, KeepFieldsConfig, ModelConfig, ModelPricingConfig, Preset,
-    PresetHeader, PresetMeta, PresetParser, StripFieldsConfig, StripNullsConfig, TerseLevel,
-    TerseModeConfig, ToolSelectionConfig, TruncateStringsConfig,
+    default_preset_toml, BudgetConfig, CollapseArraysConfig, CompressionConfig, CondenseConfig,
+    CustomTransformsConfig, FlattenConfig, GitDiffFoldConfig, KeepFieldsConfig, ModelConfig,
+    ModelPricingConfig, Preset, PresetHeader, PresetMeta, PresetParser, StripFieldsConfig,
+    StripNullsConfig, TerseLevel, TerseModeConfig, ToolSelectionConfig, TruncateStringsConfig,
 };
 pub use progressive_throttle::{ProgressiveThrottler, ThrottleConfig, ThrottleLevel};
 pub use dashboard::{

@@ -1136,7 +1136,7 @@ fn cmd_init(skip_confirm: bool, global: bool, only: Option<String>, skip: Option
     if let Err(e) = std::fs::create_dir_all(&preset_dir) {
         eprintln!("[sqz] ✗ warning: could not create preset dir {}: {e}", preset_dir.display());
     } else if !preset_path.exists() {
-        match std::fs::write(&preset_path, DEFAULT_PRESET_TOML) {
+        match std::fs::write(&preset_path, sqz_engine::default_preset_toml()) {
             Ok(()) => println!("[sqz] ✓ default preset written to {}", preset_path.display()),
             Err(e) => eprintln!("[sqz] ✗ warning: could not write preset: {e}"),
         }
@@ -3919,29 +3919,3 @@ fn install_completions(hook: &ShellHook) {
         Err(_) => {} // silently skip — completions are optional
     }
 }
-
-const DEFAULT_PRESET_TOML: &str = r#"[meta]
-name = "default"
-version = "1"
-description = "Default sqz preset"
-
-[compression]
-keep_fields.enabled = false
-strip_fields.enabled = false
-condense.enabled = true
-strip_nulls.enabled = true
-flatten.enabled = false
-truncate_strings.enabled = false
-collapse_arrays.enabled = false
-custom_transforms.enabled = false
-
-[budget]
-window_size = 200000
-warning_threshold = 0.70
-ceiling_threshold = 0.85
-default_agent_budget = 50000
-
-[terse_mode]
-enabled = false
-level = "moderate"
-"#;

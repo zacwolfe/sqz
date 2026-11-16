@@ -43,6 +43,25 @@ use crate::error::{Result, SqzError};
 /// ```
 pub struct PresetParser;
 
+/// The TOML text `sqz init` writes to `~/.sqz/presets/default.toml`.
+///
+/// Generated from [`Preset::default`] rather than hand-written so the file
+/// can never drift from the schema [`PresetParser`] parses. The CLI and the
+/// shell hook compress with the preset compiled into the binary; this file
+/// is what `sqz-mcp --preset-dir <dir>` loads.
+pub fn default_preset_toml() -> String {
+    let mut text = String::from(
+        "# Written by sqz init. The CLI and the shell hook use the preset\n\
+         # compiled into the binary; sqz-mcp reads this file when started with\n\
+         # --preset-dir. Edit a copy rather than this one.\n\n",
+    );
+    match PresetParser::to_toml(&Preset::default()) {
+        Ok(body) => text.push_str(&body),
+        Err(_) => text.push_str("# preset serialization failed\n"),
+    }
+    text
+}
+
 impl PresetParser {
     /// Parse a TOML string into a validated `Preset`.
     pub fn parse(toml_str: &str) -> Result<Preset> {
@@ -826,5 +845,50 @@ mod tests {
                 err_msg
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod preset_file_tests {
+    use super::*;
+
+    /// The file `sqz init` writes must load back through the same parser
+    /// `sqz-mcp --preset-dir` uses. A hand-written template drifted from the
+    /// serde schema once already (`[meta]` instead of `[preset]`), which made
+    /// the written file unloadable.
+    #[test]
+    fn default_preset_toml_parses_back() {
+        let text = default_preset_toml();
+        let parsed = PresetParser::parse(&text).expect("generated default preset must parse");
+        let default = Preset::default();
+        assert_eq!(parsed.preset.name, default.preset.name);
+        assert_eq!(
+            parsed.compression.max_output_tokens,
+            default.compression.max_output_tokens
+        );
+        assert_eq!(
+            parsed
+                .compression
+                .json_projection
+                .as_ref()
+                .map(|c| (c.enabled, c.summarize_deep, c.max_depth)),
+            default
+                .compression
+                .json_projection
+                .as_ref()
+                .map(|c| (c.enabled, c.summarize_deep, c.max_depth))
+        );
+    }
+
+    /// `max_output_tokens` is the knob people reach for, and it must stay
+    /// unset in the default file: the cap comes from the compiled-in
+    /// `size_cap::DEFAULT_MAX_TOKENS`.
+    #[test]
+    fn default_preset_toml_leaves_the_cap_unset() {
+        let text = default_preset_toml();
+        assert!(
+            !text.contains("max_output_tokens"),
+            "default preset should not pin the output cap:\n{text}"
+        );
     }
 }
