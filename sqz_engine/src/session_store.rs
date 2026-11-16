@@ -1266,10 +1266,15 @@ impl SessionStore {
     /// compaction or start). Used by the adaptive pressure system to
     /// decide whether to escalate compression intensity.
     pub fn session_pressure(&self, since_minutes: u32) -> Result<u64> {
+        // `julianday` on both sides, not a string comparison: `created_at` is
+        // RFC 3339 ("2026-11-16T02:55:25.378324+00:00") and `datetime('now')`
+        // returns "2026-11-16 02:25:54". The `T` sorts above the space, so a
+        // string compare counted every row from the same calendar day and the
+        // window silently became "since midnight UTC".
         let mut stmt = self.db.prepare(
             "SELECT COALESCE(SUM(tokens_compressed), 0) \
              FROM compression_log \
-             WHERE created_at >= datetime('now', ?1)",
+             WHERE julianday(created_at) >= julianday('now', ?1)",
         ).map_err(SqzError::SessionStore)?;
 
         let offset = format!("-{since_minutes} minutes");
@@ -1723,6 +1728,27 @@ mod tests {
             provenance: crate::types::Provenance::default(),
             verify: None,
         }
+    }
+
+    #[test]
+    fn pressure_window_is_relative_not_calendar() {
+        let store = in_memory_store();
+        // 400 tokens just now, 600 tokens 40 minutes ago. Only the first is
+        // inside a 30-minute window; the string comparison this used to do
+        // counted both, because both carry today's date.
+        store.log_compression(1000, 400, &[], "auto").unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO compression_log \
+                 (tokens_original, tokens_compressed, stages_applied, mode, created_at) \
+                 VALUES (1000, 600, '', 'auto', strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-40 minutes'))",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(store.session_pressure(30).unwrap(), 400);
+        assert_eq!(store.session_pressure(60).unwrap(), 1000);
     }
 
     #[test]
