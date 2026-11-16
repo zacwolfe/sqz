@@ -141,7 +141,11 @@ CREATE TABLE IF NOT EXISTS compression_log (
     tokens_compressed INTEGER NOT NULL,
     stages_applied   TEXT NOT NULL,
     mode             TEXT NOT NULL DEFAULT 'auto',
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    -- Full, uncapped caller label. `mode` is capped for display and
+    -- grouping; this preserves the original command for debugging.
+    -- NULL on rows written before this column existed.
+    cmd_full         TEXT
 );
 
 -- Compression-regret signals. A 'rerun' row means the agent re-produced
@@ -222,6 +226,18 @@ pub(crate) fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute("ALTER TABLE compression_log ADD COLUMN project_dir TEXT", [])?;
     }
 
+    // Additive migration: add `cmd_full` TEXT column to compression_log.
+    // `mode` is capped so an overlong caller label cannot bloat per-command
+    // stats; `cmd_full` keeps the original command. NULL for rows written
+    // by older sqz versions.
+    let has_cmd_full: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('compression_log') WHERE name = 'cmd_full'")?
+        .query_row([], |_| Ok(()))
+        .is_ok();
+    if !has_cmd_full {
+        conn.execute("ALTER TABLE compression_log ADD COLUMN cmd_full TEXT", [])?;
+    }
+
     // Additive migration: add `pinned` flag to cache_entries. Pinned
     // entries bypass the TTL freshness check so stable wiki / knowledge
     // base content stays dedup-able forever.
@@ -237,6 +253,40 @@ pub(crate) fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+/// Maximum display width (in chars) stored in `compression_log.mode`.
+pub const MAX_MODE_LABEL_CHARS: usize = 120;
+
+/// A label used for callers whose "command" carries no information: the
+/// bare `true`/`false`/`:` shell no-ops and empty strings. Shell hooks can
+/// pass those through verbatim (`SQZ_CMD` / `--cmd`), which pollutes
+/// per-command stats and turns rerun-regret into noise.
+pub const NOOP_LABEL: &str = "noop";
+
+/// Map an informational-noise label to [`NOOP_LABEL`]. Every real label is
+/// returned unchanged so compression behaviour and existing stats keys stay
+/// byte-identical.
+pub fn normalize_mode_label(label: &str) -> &str {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || matches!(trimmed, "true" | "false" | ":") {
+        NOOP_LABEL
+    } else {
+        label
+    }
+}
+
+/// Cap a caller-supplied label for the `mode` column. Short labels are
+/// returned byte-identical. Longer labels are whitespace-collapsed and
+/// truncated on a char boundary to [`MAX_MODE_LABEL_CHARS`], ending in `…`.
+fn cap_mode_label(label: &str) -> String {
+    if label.chars().count() <= MAX_MODE_LABEL_CHARS {
+        return label.to_string();
+    }
+    let collapsed = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut capped: String = collapsed.chars().take(MAX_MODE_LABEL_CHARS - 1).collect();
+    capped.push('…');
+    capped
 }
 
 fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
@@ -1015,9 +1065,14 @@ impl SessionStore {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let stages_str = stages.join(",");
+        // Keep the full original label for debugging, but normalize the
+        // noise labels and cap the display/grouping column.
+        let cmd_full = mode;
+        let mode = normalize_mode_label(mode);
+        let mode = cap_mode_label(mode);
         self.db.execute(
-            "INSERT INTO compression_log (tokens_original, tokens_compressed, stages_applied, mode, created_at, project_dir) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![tokens_original, tokens_compressed, stages_str, mode, now, project_dir],
+            "INSERT INTO compression_log (tokens_original, tokens_compressed, stages_applied, mode, created_at, project_dir, cmd_full) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![tokens_original, tokens_compressed, stages_str, mode, now, project_dir, cmd_full],
         ).map_err(SqzError::SessionStore)?;
         Ok(())
     }
@@ -1887,6 +1942,41 @@ mod tests {
             provenance: crate::types::Provenance::default(),
             verify: None,
         }
+    }
+
+    #[test]
+    fn long_labels_are_capped_but_cmd_full_is_retained() {
+        let store = in_memory_store();
+        let long = format!("git log --oneline {}", "x".repeat(300));
+        store.log_compression(100, 40, &[], &long).unwrap();
+        let (mode, full): (String, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT mode, cmd_full FROM compression_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode.chars().count(), MAX_MODE_LABEL_CHARS);
+        assert!(mode.ends_with('…'), "capped label must end in an ellipsis: {mode}");
+        assert_eq!(full.as_deref(), Some(long.as_str()), "cmd_full must keep the original");
+    }
+
+    #[test]
+    fn short_labels_stay_byte_identical_and_noise_labels_normalize() {
+        let store = in_memory_store();
+        store.log_compression(100, 40, &[], "cargo test").unwrap();
+        store.log_compression(100, 40, &[], " true ").unwrap();
+        store.log_compression(100, 40, &[], "dedup").unwrap();
+        let modes: Vec<String> = store
+            .db
+            .prepare("SELECT mode FROM compression_log ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(modes, vec!["cargo test", "noop", "dedup"]);
     }
 
     #[test]
