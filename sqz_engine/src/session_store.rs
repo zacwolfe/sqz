@@ -1578,6 +1578,81 @@ impl SessionStore {
             .collect())
     }
 
+    /// Per-stage breakdown from `compression_log.stages_applied`.
+    ///
+    /// `stages_applied` is a comma-joined list, and a row is credited in
+    /// full to every stage it ran. The per-stage token totals therefore
+    /// overlap by construction: they describe which stages do the work,
+    /// and MUST NOT be summed into a grand total. Rows with no recorded
+    /// stage are skipped.
+    ///
+    /// Returns `(stage, tokens_in, tokens_out, rows)` sorted by row count.
+    pub fn stage_breakdown(&self) -> Result<Vec<(String, u64, u64, u32)>> {
+        self.stage_breakdown_inner(None)
+    }
+
+    /// [`stage_breakdown`](Self::stage_breakdown) filtered to one project.
+    pub fn stage_breakdown_for_project(
+        &self,
+        project_dir: &str,
+    ) -> Result<Vec<(String, u64, u64, u32)>> {
+        self.stage_breakdown_inner(Some(project_dir))
+    }
+
+    fn stage_breakdown_inner(
+        &self,
+        project_dir: Option<&str>,
+    ) -> Result<Vec<(String, u64, u64, u32)>> {
+        // Group in SQLite first so only distinct stage strings cross into
+        // Rust; splitting those in memory is cheaper than recursing in SQL.
+        let sql = if project_dir.is_some() {
+            "SELECT stages_applied, SUM(tokens_original), SUM(tokens_compressed), COUNT(*) \
+             FROM compression_log WHERE project_dir = ?1 \
+             GROUP BY stages_applied ORDER BY COUNT(*) DESC LIMIT 50"
+        } else {
+            "SELECT stages_applied, SUM(tokens_original), SUM(tokens_compressed), COUNT(*) \
+             FROM compression_log GROUP BY stages_applied ORDER BY COUNT(*) DESC LIMIT 50"
+        };
+        let mut stmt = self.db.prepare(sql).map_err(SqzError::SessionStore)?;
+
+        let mut stages: std::collections::HashMap<String, (u64, u64, u32)> =
+            std::collections::HashMap::new();
+        let mut collect = |row: &rusqlite::Row<'_>| {
+            let stages_str: String = row.get(0)?;
+            let tokens_in: u64 = row.get(1)?;
+            let tokens_out: u64 = row.get(2)?;
+            let count: u32 = row.get(3)?;
+            Ok((stages_str, tokens_in, tokens_out, count))
+        };
+
+        if let Some(dir) = project_dir {
+            let rows = stmt
+                .query_map(params![dir], |row| collect(row))
+                .map_err(SqzError::SessionStore)?;
+            for row in rows {
+                let (stages_str, tokens_in, tokens_out, count) =
+                    row.map_err(SqzError::SessionStore)?;
+                add_stage_row(&mut stages, &stages_str, tokens_in, tokens_out, count);
+            }
+        } else {
+            let rows = stmt
+                .query_map([], |row| collect(row))
+                .map_err(SqzError::SessionStore)?;
+            for row in rows {
+                let (stages_str, tokens_in, tokens_out, count) =
+                    row.map_err(SqzError::SessionStore)?;
+                add_stage_row(&mut stages, &stages_str, tokens_in, tokens_out, count);
+            }
+        }
+
+        let mut result: Vec<_> = stages
+            .into_iter()
+            .map(|(name, (tin, tout, cnt))| (name, tin, tout, cnt))
+            .collect();
+        result.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        Ok(result)
+    }
+
     /// Per-command breakdown: group compression_log by mode.
     pub fn per_command_breakdown(&self) -> Result<Vec<(String, u64, u64, u32)>> {
         let mut stmt = self
@@ -1662,6 +1737,28 @@ pub struct SliceCandidate {
     pub hash: String,
     pub original: Vec<u8>,
     pub data_json: String,
+}
+
+/// Add one `stages_applied` group to a stage breakdown map. A row is
+/// credited in full to every stage it ran, matching the comma-joined
+/// storage format.
+fn add_stage_row(
+    stages: &mut std::collections::HashMap<String, (u64, u64, u32)>,
+    stages_str: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    count: u32,
+) {
+    for stage in stages_str.split(',') {
+        let stage = stage.trim();
+        if stage.is_empty() {
+            continue;
+        }
+        let entry = stages.entry(stage.to_string()).or_default();
+        entry.0 += tokens_in;
+        entry.1 += tokens_out;
+        entry.2 += count;
+    }
 }
 
 /// One `sqz recall` search hit.
@@ -1783,6 +1880,48 @@ mod tests {
 
         assert_eq!(store.session_pressure(30).unwrap(), 400);
         assert_eq!(store.session_pressure(60).unwrap(), 1000);
+    }
+
+    #[test]
+    fn stage_breakdown_credits_each_stage_a_row_ran() {
+        let store = in_memory_store();
+        store
+            .log_compression(
+                1000,
+                400,
+                &["condense".to_string(), "path_shorten".to_string()],
+                "git",
+            )
+            .unwrap();
+        store
+            .log_compression(500, 100, &["condense".to_string()], "cargo")
+            .unwrap();
+        store.log_compression(200, 200, &[], "auto").unwrap();
+        store
+            .log_compression(300, 30, &["dedup".to_string()], "dedup")
+            .unwrap();
+
+        let rows = store.stage_breakdown().unwrap();
+        let find = |name: &str| rows.iter().find(|(n, ..)| n == name).cloned();
+
+        assert_eq!(
+            find("condense").unwrap(),
+            ("condense".to_string(), 1500, 500, 2)
+        );
+        // Credited in full to every stage the row ran, not split between them.
+        assert_eq!(
+            find("path_shorten").unwrap(),
+            ("path_shorten".to_string(), 1000, 400, 1)
+        );
+        assert_eq!(
+            find("dedup").unwrap(),
+            ("dedup".to_string(), 300, 30, 1)
+        );
+        assert_eq!(rows.len(), 3, "rows without a recorded stage are skipped");
+
+        // The overlap is the point: summed stage totals exceed the real total.
+        let stage_in_sum: u64 = rows.iter().map(|r| r.1).sum();
+        assert!(stage_in_sum > store.compression_stats().unwrap().total_tokens_in);
     }
 
     #[test]
