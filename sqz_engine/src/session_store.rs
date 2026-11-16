@@ -676,11 +676,36 @@ impl SessionStore {
     }
 
     /// Return all cache entries ordered by `accessed_at` ASC (oldest first),
-    /// as `(hash, size_bytes)` pairs where `size_bytes` is the byte length of
-    /// the stored JSON data.
+    /// as `(hash, size_bytes)` pairs where `size_bytes` is the total stored
+    /// size of the row: the byte length of the stored JSON `data` plus the
+    /// byte length of the raw `original` blob when present. Both columns are
+    /// real on-disk payload, so reporting only `length(data)` understated a
+    /// typical cache by roughly half.
     pub fn list_cache_entries_lru(&self) -> Result<Vec<(String, u64)>> {
         let mut stmt = self.db.prepare(
-            "SELECT hash, length(data) FROM cache_entries ORDER BY accessed_at ASC",
+            "SELECT hash, length(data) + COALESCE(length(original), 0) \
+             FROM cache_entries ORDER BY accessed_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (hash, size) = row?;
+            entries.push((hash, size as u64));
+        }
+        Ok(entries)
+    }
+
+    /// Return the same `(hash, size_bytes)` pairs as
+    /// [`list_cache_entries_lru`](Self::list_cache_entries_lru), but only for
+    /// entries that are eligible for eviction (i.e. not pinned), oldest
+    /// accessed first. Pinned entries are exempt from the cache budget and
+    /// must never be deleted by LRU eviction.
+    pub fn list_evictable_cache_entries_lru(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT hash, length(data) + COALESCE(length(original), 0) \
+             FROM cache_entries WHERE pinned = 0 ORDER BY accessed_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -909,14 +934,17 @@ impl SessionStore {
     }
 
     /// List every pinned cache entry. Returns `(hash, accessed_at, size_bytes)`
-    /// tuples so the CLI can render a useful table.
+    /// tuples so the CLI can render a useful table. `size_bytes` covers both
+    /// stored columns (`data` plus `original`) so it matches the cache-size
+    /// accounting used by `sqz stats`.
     pub fn list_pinned_cache_entries(
         &self,
     ) -> Result<Vec<(String, DateTime<Utc>, u64)>> {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT hash, accessed_at, length(data) FROM cache_entries \
+                "SELECT hash, accessed_at, \
+                 length(data) + COALESCE(length(original), 0) FROM cache_entries \
                  WHERE pinned = 1 ORDER BY accessed_at DESC",
             )
             .map_err(SqzError::SessionStore)?;
@@ -2246,6 +2274,44 @@ mod tests {
         assert_eq!(loaded.data, entry.data);
         assert_eq!(loaded.tokens_compressed, entry.tokens_compressed);
         assert_eq!(loaded.tokens_original, entry.tokens_original);
+    }
+
+    #[test]
+    fn cache_size_accounting_includes_original_bytes() {
+        let store = in_memory_store();
+        let entry = CompressedContent {
+            data: "compressed payload".to_string(),
+            tokens_compressed: 3,
+            tokens_original: 12,
+            stages_applied: vec![],
+            compression_ratio: 0.25,
+            provenance: crate::types::Provenance::default(),
+            verify: None,
+        };
+        // `save_cache_entry_with_original` stores the serialized struct in
+        // `data`, so the expected row size is that JSON plus the raw blob.
+        let data_bytes = serde_json::to_string(&entry).unwrap().len() as u64;
+        let original = b"raw uncompressed output bytes";
+
+        store
+            .save_cache_entry_with_original("hash-sized", &entry, Some(original))
+            .unwrap();
+        // A legacy-style row with no original still counts its `data` bytes.
+        store.save_cache_entry("hash-legacy", &entry).unwrap();
+
+        let entries = store.list_cache_entries_lru().unwrap();
+        let size_of = |hash: &str| {
+            entries
+                .iter()
+                .find(|(h, _)| h == hash)
+                .unwrap_or_else(|| panic!("missing {hash}"))
+                .1
+        };
+
+        assert_eq!(size_of("hash-sized"), data_bytes + original.len() as u64);
+        assert_eq!(size_of("hash-legacy"), data_bytes);
+        let total: u64 = entries.iter().map(|(_, size)| size).sum();
+        assert_eq!(total, data_bytes * 2 + original.len() as u64);
     }
 
     #[test]
