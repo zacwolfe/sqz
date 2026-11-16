@@ -34,6 +34,40 @@ pub struct SessionSummary {
 ///     println!("{}: {}", session.id, session.compressed_summary);
 /// }
 /// ```
+///
+/// ## Purging fixture rows from an older local database
+///
+/// Before tests were isolated, running the suite could append synthetic
+/// rows to a developer's real `~/.sqz/sessions.db`. Property tests replayed
+/// fixture commands (`cargo test`, `curl`, `ls`, `npm install`, `pytest`,
+/// `docker build`, `git diff`, `tail`) once per generated case, leaving a
+/// `regret_log` with a small, fixed number of rows per command. Those rows
+/// describe no real usage and can distort `sqz stats` and
+/// `sqz discover`.
+///
+/// Back up the database first, preview the rows for the date of the polluted
+/// test run, then delete that same selection. Run these only against a
+/// database you have backed up, and not while an agent session is writing to
+/// it:
+///
+/// ```sh
+/// cp ~/.sqz/sessions.db ~/.sqz/sessions.db.bak
+/// # Preview first; replace YYYY-MM-DD with the polluted day.
+/// sqlite3 ~/.sqz/sessions.db \
+///   "SELECT id, kind, cmd, created_at FROM regret_log
+///      WHERE cmd IN ('cargo test','curl','ls','npm install',
+///                    'pytest','docker build','git diff','tail')
+///        AND date(created_at) = 'YYYY-MM-DD';"
+/// sqlite3 ~/.sqz/sessions.db \
+///   "DELETE FROM regret_log
+///      WHERE cmd IN ('cargo test','curl','ls','npm install',
+///                    'pytest','docker build','git diff','tail')
+///        AND date(created_at) = 'YYYY-MM-DD';"
+/// sqlite3 ~/.sqz/sessions.db "VACUUM;"
+/// ```
+///
+/// Scope the `WHERE` to the polluted date. Deleting by command alone can
+/// remove genuine rows from real `curl` or `git diff` usage.
 pub struct SessionStore {
     db: Connection,
 }
