@@ -453,11 +453,11 @@ impl CliProxy {
                     return shown;
                 }
                 self.log_compression(
-            cmd,
-            tokens_original,
-            self.engine.count_tokens(&shown),
-            &["cmd_formatter".to_string()],
-        );
+                    cmd,
+                    tokens_original,
+                    self.engine.count_tokens(&shown),
+                    &["cmd_formatter".to_string()],
+                );
                 return shown;
             }
         }
