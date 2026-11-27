@@ -1282,7 +1282,9 @@ complexity_threshold = 0.4
             SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db"))
                 .unwrap();
 
-        let payload = "line of repetitive text 0123456789\n".repeat(200_000);
+        let payload = (0..200_000)
+            .map(|i| format!("line {i} of repetitive text 0123456789\n"))
+            .collect::<String>();
         let result = engine
             .compress_with_mode(&payload, CompressionMode::Safe)
             .unwrap();
