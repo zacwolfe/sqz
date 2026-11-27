@@ -1728,7 +1728,7 @@ impl SessionStore {
 
         let mut stages: std::collections::HashMap<String, (u64, u64, u32)> =
             std::collections::HashMap::new();
-        let mut collect = |row: &rusqlite::Row<'_>| {
+        let collect = |row: &rusqlite::Row<'_>| {
             let stages_str: String = row.get(0)?;
             let tokens_in: u64 = row.get(1)?;
             let tokens_out: u64 = row.get(2)?;
