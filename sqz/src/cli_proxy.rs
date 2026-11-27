@@ -448,11 +448,16 @@ impl CliProxy {
                         cmd,
                         tokens_original,
                         self.engine.count_tokens(&shown),
-                        &["size_cap".to_string()],
+                        &["cmd_formatter".to_string(), "size_cap".to_string()],
                     );
                     return shown;
                 }
-                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown), &[]);
+                self.log_compression(
+            cmd,
+            tokens_original,
+            self.engine.count_tokens(&shown),
+            &["cmd_formatter".to_string()],
+        );
                 return shown;
             }
         }
