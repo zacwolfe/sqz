@@ -1282,8 +1282,16 @@ complexity_threshold = 0.4
             SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db"))
                 .unwrap();
 
-        let payload = (0..200_000)
-            .map(|i| format!("line {i} of repetitive text 0123456789\n"))
+        // Unique per line *and* varying word count: `condense` only folds
+        // identical lines, `log_template` only folds digit-masked templates,
+        // and `collapse_indexed_rows` needs adjacent rows with the same token
+        // count, so this payload survives every stage and reaches the cap.
+        // ~130 KB is >4x DEFAULT_MAX_TOKENS yet cheap to tokenize in a debug build.
+        let payload = (0..4_000u32)
+            .map(|i| {
+                let pad = "filler ".repeat((i % 7) as usize);
+                format!("row {i:05} {pad}tail value {}\n", i.wrapping_mul(2_654_435_761))
+            })
             .collect::<String>();
         let result = engine
             .compress_with_mode(&payload, CompressionMode::Safe)
