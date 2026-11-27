@@ -10,6 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::io::IsTerminal;
 use std::path::Path;
 use sqz_engine::{format_command, CompressedContent, DependencyMapper, NgramAbbreviator, SqzEngine};
 
@@ -149,11 +150,27 @@ impl InterceptOptions {
     }
 }
 
-/// Suppress informational stderr lines when `SQZ_QUIET=1`.
+/// Suppress informational stderr lines when `SQZ_QUIET` says so, or when
+/// stderr is not a terminal (the agent/hook case, where banners only add
+/// context tokens). `SQZ_QUIET=0` forces banners on for interactive debugging.
 /// Checked per print site rather than cached: replay flips the env var
 /// at runtime, and these paths are nowhere near hot enough to care.
 fn quiet() -> bool {
-    sqz_engine::SqzEngine::quiet_stderr()
+    quiet_decision(
+        std::env::var("SQZ_QUIET").ok().as_deref(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+/// Pure decision for [`quiet`], split out for testing. `env` is the raw
+/// `SQZ_QUIET` value (if set); `stderr_is_tty` whether stderr is an
+/// interactive terminal.
+fn quiet_decision(env: Option<&str>, stderr_is_tty: bool) -> bool {
+    match env.map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => !stderr_is_tty,
+    }
 }
 
 /// Run `f`, or return where it panicked, without printing the panic message.
@@ -176,6 +193,18 @@ pub fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, Option<String>> {
 
 const NET_WIN_MIN_TOKENS: u32 = 16;
 
+/// Stack-trace payload the router classifies as high-risk (Safe route).
+const STACK_TRACE_FIXTURE: &str = "\
+thread 'main' panicked at src/db.rs:42:9:
+connection refused
+stack backtrace:
+   0: rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: sqz_engine::db::connect
+   3: sqz_engine::main
+password=hunter2
+";
+
 /// Outputs this long dwarf a ref and its note, so the ref gate skips counting them.
 const REF_GATE_MAX_BYTES: usize = 1024;
 
@@ -188,6 +217,35 @@ fn only_trailing_space_differs(output: &str, formatted: &str) -> bool {
             .len();
     formatted == output
         || (output.len() - body.len() < 8 && punct <= 8 && formatted.trim_end() == body)
+}
+
+/// Whether a formatter's output may stand in for `output`.
+///
+/// Formatters drop lines by design (transfer progress, install logs, duplicate
+/// status lines), so on the Safe route a formatter is a lossy transform. It
+/// clears the formatter contract instead of the pipeline checks: every line
+/// carrying diagnostic signal has to survive verbatim. When it does not, the
+/// caller shows the raw output. Other routes keep the historical behaviour:
+/// the formatter is the intended transform.
+fn formatter_output_verified(engine: &SqzEngine, output: &str, formatted: &str) -> bool {
+    formatter_rejection(engine, output, formatted).is_none()
+}
+
+/// The formatter-contract violations, or `None` when the output may stand in.
+fn formatter_rejection(
+    engine: &SqzEngine,
+    output: &str,
+    formatted: &str,
+) -> Option<Vec<String>> {
+    if engine.route_compression_mode(output) != sqz_engine::CompressionMode::Safe {
+        return None;
+    }
+    let losses = sqz_engine::Verifier::formatter_losses(output, formatted);
+    if losses.is_empty() {
+        None
+    } else {
+        Some(losses)
+    }
 }
 
 pub struct CliProxy {
@@ -286,7 +344,7 @@ impl CliProxy {
                     if !quiet() {
                         eprintln!("{note}");
                     }
-                    self.maybe_log_rerun_regret(cmd, &hit);
+                    self.maybe_log_rerun_regret(cmd, &hit, output);
                     self.log_dedup_hit(cmd, output);
                     return hit.inline_ref;
                 }
@@ -303,7 +361,7 @@ impl CliProxy {
                     if !quiet() {
                         eprintln!("{note}");
                     }
-                    self.maybe_log_rerun_regret(cmd, &hit);
+                    self.maybe_log_rerun_regret(cmd, &hit, output);
                     self.log_dedup_hit(cmd, output);
                     return hit.inline_ref;
                 }
@@ -354,13 +412,26 @@ impl CliProxy {
             // Real token counts, as on the pipeline path: collapsing column
             // padding shrinks chars/4 a lot and BPE tokens hardly at all.
             let tokens_original = self.engine.count_tokens(output);
+            let (formatted, cap_hit) = match sqz_engine::size_cap::cap_to_tokens(&formatted, sqz_engine::size_cap::DEFAULT_MAX_TOKENS, |s| self.engine.count_tokens(s)) {
+                Some(c) => (c, true),
+                None => (formatted, false),
+            };
             let tokens_compressed = self.engine.count_tokens(&formatted);
-            if tokens_original.saturating_sub(tokens_compressed) >= NET_WIN_MIN_TOKENS {
+            if let Some(broken) = formatter_rejection(&self.engine, output, &formatted) {
+                if !quiet() {
+                    eprintln!(
+                        "[sqz] formatter bypassed for '{cmd}': verification failed ({}), showing raw output",
+                        broken.join("; ")
+                    );
+                }
+                return output.to_owned();
+            }
+            if tokens_original.saturating_sub(tokens_compressed) >= NET_WIN_MIN_TOKENS || cap_hit {
                 // Persist to L2 cache — but skip if content contains secrets
-                // (confidence router detected high-risk patterns like API keys)
                 let never_store = self.engine.never_store(output);
                 if !never_store {
-                    if let Ok(compressed) = self.engine.compress(&formatted) {
+                    let to_store = if cap_hit { output } else { &formatted };
+                    if let Ok(compressed) = self.engine.compress(to_store) {
                         let _ = self.engine.cache_manager().store_compressed(output.as_bytes(), &compressed);
                     }
                 }
@@ -370,7 +441,23 @@ impl CliProxy {
                     && never_store
                     && self.engine.route_compression_mode(output) == sqz_engine::CompressionMode::Safe;
                 let shown = if safe { formatted } else { annotated };
-                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                if cap_hit && !never_store {
+                    let hash = sqz_engine::CacheManager::sha256_hex(output.as_bytes());
+                    let shown = format!("{shown}\n[full output: sqz expand {}]", &hash[..16]);
+                    self.log_compression(
+                        cmd,
+                        tokens_original,
+                        self.engine.count_tokens(&shown),
+                        &["cmd_formatter".to_string(), "size_cap".to_string()],
+                    );
+                    return shown;
+                }
+                self.log_compression(
+                    cmd,
+                    tokens_original,
+                    self.engine.count_tokens(&shown),
+                    &["cmd_formatter".to_string()],
+                );
                 return shown;
             }
         }
@@ -382,7 +469,7 @@ impl CliProxy {
                 let lossy = compressed
                     .stages_applied
                     .iter()
-                    .any(|s| s == "entropy_truncate" || s == "toon_encode");
+                .any(|s| s == "entropy_truncate" || s == "toon_encode" || s == "size_cap");
                 // Persist to L2 cache, but never content that may contain
                 // secrets, API keys, passwords
                 let safe = self.engine.route_compression_mode(output) == sqz_engine::CompressionMode::Safe;
@@ -455,13 +542,19 @@ impl CliProxy {
                 // original passes through and no savings are recorded. The
                 // L2 store above still happens, so a repeat of this content
                 // resolves to a dedup ref.
+                let capped = compressed.stages_applied.iter().any(|s| s == "size_cap");
                 let tokens_final = self.engine.count_tokens(&abbreviated);
-                if tokens_original.saturating_sub(tokens_final) < NET_WIN_MIN_TOKENS {
+                if !capped && tokens_original.saturating_sub(tokens_final) < NET_WIN_MIN_TOKENS {
                     return if safe { output.to_owned() } else { self.apply_context_refs(output) };
                 }
 
                 let shown = if safe { abbreviated } else { self.apply_context_refs(&abbreviated) };
-                self.log_compression(cmd, tokens_original, self.engine.count_tokens(&shown));
+                self.log_compression(
+                    cmd,
+                    tokens_original,
+                    self.engine.count_tokens(&shown),
+                    &compressed.stages_applied,
+                );
                 shown
             }
             Err(e) => {
@@ -488,7 +581,28 @@ impl CliProxy {
     /// bought nothing, which usually means the compressed first serving
     /// was missing something. Window defaults to 120s; override with
     /// `SQZ_REGRET_WINDOW_SECS` (0 disables).
-    fn maybe_log_rerun_regret(&self, cmd: &str, hit: &sqz_engine::DedupHit) {
+    ///
+    /// Only a hit that actually withheld a materially larger payload counts:
+    /// an empty or tiny repeat served as a ref says nothing about whether
+    /// compression dropped information. Noise labels (`true`, `false`, `:`,
+    /// empty) are skipped for the same reason.
+    fn maybe_log_rerun_regret(
+        &self,
+        cmd: &str,
+        hit: &sqz_engine::DedupHit,
+        output: &str,
+    ) {
+        // A bare no-op label carries no command identity; a "regret" there is
+        // an artefact of the caller, not a real lossy-compression signal.
+        if sqz_engine::session_store::normalize_mode_label(cmd) == sqz_engine::session_store::NOOP_LABEL {
+            return;
+        }
+        // The ref token costs ~13 tokens; if the body was no larger than that
+        // plus the net-win margin there was nothing meaningful to withhold.
+        const DEDUP_REF_TOKENS: u32 = 13;
+        if self.engine.count_tokens(output) <= DEDUP_REF_TOKENS + NET_WIN_MIN_TOKENS {
+            return;
+        }
         const DEFAULT_WINDOW_SECS: f64 = 120.0;
         let window = std::env::var("SQZ_REGRET_WINDOW_SECS")
             .ok()
@@ -500,24 +614,38 @@ impl CliProxy {
         let Some(prev) = hit.prev_accessed_at else { return };
         let gap = (chrono::Utc::now() - prev).num_milliseconds() as f64 / 1000.0;
         if gap >= 0.0 && gap <= window {
-            let _ = self
-                .engine
-                .session_store()
-                .log_regret("rerun", cmd, &hit.hash, gap);
+            // One regret per (cmd, hash) per window, even when the caller
+            // re-runs in a tight loop.
+            let _ = self.engine.session_store().log_regret_deduped(
+                "rerun",
+                sqz_engine::session_store::normalize_mode_label(cmd),
+                &hit.hash,
+                gap,
+                window,
+            );
         }
     }
 
     /// Log compression stats to stderr.
-    fn log_compression(&self, cmd: &str, original: u32, compressed: u32) {
+    ///
+    /// The banner goes to stderr, which Claude Code's Bash tool captures into
+    /// the tool result — so it costs context tokens on every hooked command.
+    /// Suppress it when it isn't earning its keep:
+    /// - `SQZ_QUIET=1` (or `true`/`yes`/`on`) silences it entirely.
+    /// - A 0% reduction means the banner is pure overhead (it added tokens
+    ///   while compression saved none), so skip it.
+    ///
+    /// The session-DB stats logging below always runs, regardless.
+    fn log_compression(&self, cmd: &str, original: u32, compressed: u32, stages: &[String]) {
         let saved = original.saturating_sub(compressed);
         let pct = if original > 0 { (saved as f64 / original as f64 * 100.0) as u32 } else { 0 };
-        if !quiet() {
+        if !quiet() && pct > 0 {
             eprintln!("[sqz] {}/{} tokens ({}% reduction) [{}]", compressed, original, pct, cmd);
         }
         let project = std::env::current_dir().ok();
         let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
         let _ = self.engine.session_store().log_compression_with_project(
-            original, compressed, &[], cmd,
+            original, compressed, stages, cmd,
             project_str.as_deref(),
         );
         #[cfg(debug_assertions)]
@@ -753,6 +881,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_quiet_decision() {
+        // Explicit opt-out wins regardless of tty.
+        assert!(quiet_decision(Some("1"), true));
+        assert!(quiet_decision(Some(" true "), true));
+        assert!(quiet_decision(Some("on"), false));
+        // Explicit opt-in wins regardless of tty (force banner under hook).
+        assert!(!quiet_decision(Some("0"), false));
+        assert!(!quiet_decision(Some("false"), false));
+        // Unset: follow the terminal. Non-tty (agent/hook) → quiet;
+        // interactive terminal → show.
+        assert!(quiet_decision(None, false));
+        assert!(!quiet_decision(None, true));
+        // Unrecognized value falls through to the tty heuristic.
+        assert!(quiet_decision(Some("maybe"), false));
+        assert!(!quiet_decision(Some("maybe"), true));
+    }
+
+    #[test]
     fn test_is_known_command_git() {
         assert!(CliProxy::is_known_command("git"));
         assert!(CliProxy::is_known_command("/usr/bin/git"));
@@ -774,6 +920,60 @@ mod tests {
         let engine = SqzEngine::with_preset_and_store(sqz_engine::Preset::default(), &store)
             .expect("engine init");
         (CliProxy::with_engine(engine), dir)
+    }
+
+    /// A formatter that drops needed detail on the Safe route is a lossy
+    /// transform the pipeline would never be allowed to make. The gate has to
+    /// reject it so `intercept_output` shows the raw output instead.
+    #[test]
+    fn formatter_gate_rejects_lossy_output_on_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let mut output = String::from("thread 'main' panicked at src/db.rs:42:9:\nstack backtrace:\n");
+        for i in 0..40 {
+            output.push_str(&format!("    {}: app::module_{}::call at /repo/src/mod_{}.rs:{}\n", i, i, i, i));
+        }
+        output.push_str("password=hunter2\n");
+        assert_eq!(
+            proxy.engine.route_compression_mode(&output),
+            sqz_engine::CompressionMode::Safe,
+            "payload must route Safe for this test to mean anything"
+        );
+
+        let lossy = "build finished: ok\n";
+        assert!(
+            !formatter_output_verified(&proxy.engine, &output, lossy),
+            "gate accepted a formatter output the verifier rejects"
+        );
+        // Dropping the payload entirely is the extreme case of the same thing.
+        assert!(!formatter_output_verified(&proxy.engine, &output, ""));
+    }
+
+    /// A formatter that keeps the payload intact loses nothing, so the gate
+    /// must let it through and the route keeps its savings.
+    #[test]
+    fn formatter_gate_allows_faithful_output_on_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let output = STACK_TRACE_FIXTURE;
+        assert_eq!(
+            proxy.engine.route_compression_mode(output),
+            sqz_engine::CompressionMode::Safe
+        );
+        let formatted = output.replace("   ", "  ");
+        assert!(formatter_output_verified(&proxy.engine, output, &formatted));
+        assert!(formatter_output_verified(&proxy.engine, output, output));
+    }
+
+    /// Outside Safe the formatter *is* the intended transform, so the gate must
+    /// not add a second, stricter policy there.
+    #[test]
+    fn formatter_gate_is_noop_outside_safe_route() {
+        let (proxy, _dir) = isolated_proxy();
+        let output = "test result: ok. 42 passed; 0 failed; 0 ignored\n";
+        assert_ne!(
+            proxy.engine.route_compression_mode(output),
+            sqz_engine::CompressionMode::Safe
+        );
+        assert!(formatter_output_verified(&proxy.engine, output, "tests: 42 passed\n"));
     }
 
     #[test]
@@ -929,6 +1129,116 @@ mod tests {
         assert_eq!(top[0].0, "git log");
     }
 
+    /// A genuinely large repeat is the only signal rerun-regret exists to
+    /// capture: the payload was materially bigger than the ref token, so the
+    /// agent re-producing it means the ref withheld something it needed. Even
+    /// when the caller re-runs in a tight loop, that is one regret, not three.
+    #[test]
+    fn repeated_large_rerun_logs_exactly_one_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "large-rerun-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "large rerun content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be stored in the dedup cache and make the ref pay off\n"
+                .repeat(40),
+        );
+        // Comfortably above the ref cost plus the net-win margin, so this is
+        // a real withheld payload rather than a noise repeat.
+        assert!(
+            proxy.engine.count_tokens(&output) > 13 + NET_WIN_MIN_TOKENS,
+            "fixture must be large enough to qualify as a genuine regret"
+        );
+
+        let store = proxy.engine.session_store();
+        for attempt in 0..3 {
+            let result = proxy.intercept_output("git log", &output);
+            if attempt > 0 {
+                assert!(
+                    result.starts_with("§ref:"),
+                    "attempt {attempt} should be served as a dedup ref, got: {result}"
+                );
+            }
+            let reruns = store.regret_stats().unwrap().reruns;
+            assert_eq!(
+                reruns,
+                u32::from(attempt > 0),
+                "attempt {attempt}: exactly one rerun signal for one withheld payload"
+            );
+        }
+        assert_eq!(
+            store.regret_by_command(5).unwrap()[0].0,
+            "git log",
+            "the regret must be attributed to the real command label"
+        );
+    }
+
+    #[test]
+    fn noop_label_does_not_produce_rerun_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "noop-regret-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "noop test content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be withheld as a ref\n".repeat(5),
+        );
+
+        proxy.intercept_output("true", &output);
+        let second = proxy.intercept_output("true", &output);
+        assert!(second.starts_with("§ref:"), "expected dedup ref, got: {second}");
+        assert_eq!(
+            proxy.engine.session_store().regret_stats().unwrap().reruns,
+            0,
+            "a bare `true` label must not be scored as rerun regret"
+        );
+
+        // The stats row is recorded under the dedicated non-command label.
+        let breakdown = proxy.engine.session_store().per_command_breakdown().unwrap();
+        assert!(
+            breakdown.iter().any(|(mode, ..)| mode == "noop"),
+            "expected a noop row, got {breakdown:?}"
+        );
+        assert!(
+            !breakdown.iter().any(|(mode, ..)| mode == "true"),
+            "`true` must never be recorded as a command label"
+        );
+    }
+
+    #[test]
+    fn no_dedup_run_logs_no_rerun_regret() {
+        let (proxy, _dir) = isolated_proxy();
+        let unique_tag = format!(
+            "no-dedup-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now(),
+        );
+        let output = format!(
+            "no dedup content with {}\n{}",
+            unique_tag,
+            "line of output long enough to be withheld as a ref\n".repeat(5),
+        );
+        let opts = InterceptOptions {
+            no_cache: true,
+            abbreviate: false,
+            ..InterceptOptions::default()
+        };
+        proxy.intercept_output_with_options("git log", &output, opts);
+        proxy.intercept_output_with_options("git log", &output, opts);
+        assert_eq!(
+            proxy.engine.session_store().regret_stats().unwrap().reruns,
+            0,
+            "no dedup hit means no rerun regret"
+        );
+    }
+
     #[test]
     fn stats_count_the_tokens_that_were_printed() {
         let (proxy, _dir) = isolated_proxy();
@@ -997,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_output_keeps_its_spill_ref() {
+    fn path_rows_survive_output_truncation_while_filler_is_dropped() {
         let (proxy, _dir) = isolated_proxy();
         let output = (0..24)
             .map(|i| {
@@ -1009,11 +1319,26 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let fallback = proxy.engine.compress(&output).unwrap();
-        assert_eq!(fallback.provenance.label.as_deref(), Some("safe-fallback"));
+        // Byte-entropy ranking scored the single-byte `llllllll` filler rows
+        // below the plain prose, so truncation dropped the rows carrying file
+        // paths. Identity-bearing rows now outrank filler.
+        let compressed = proxy.engine.compress(&output).unwrap();
+        for i in (0..24).step_by(2) {
+            assert!(
+                compressed.data.contains(&format!("/srv/app/mod_{i}.py")),
+                "dropped path row {i}: {}",
+                compressed.data
+            );
+        }
+        assert!(!compressed.data.contains("quick brown fox"), "{}", compressed.data);
+        assert!(compressed.data.contains("low-information segments omitted"), "{}", compressed.data);
+        assert!(compressed.data.len() < output.len());
+        assert!(compressed.verify.as_ref().is_some_and(|v| v.passed));
+
         let result = proxy.intercept_output("tail app.log", &output);
-        let hash = sqz_engine::CacheManager::sha256_hex(output.as_bytes());
-        assert!(result.ends_with(&format!("[full output: sqz expand {}]", &hash[..16])), "{result}");
+        for i in (0..24).step_by(2) {
+            assert!(result.contains(&format!("/srv/app/mod_{i}.py")), "{result}");
+        }
         assert!(result.contains("low-information segments omitted"), "{result}");
     }
 
@@ -1121,6 +1446,21 @@ mod tests {
                 "output must not contain '{wrong}' ({why}) — got:\n{result}"
             );
         }
+    }
+
+    #[test]
+    fn test_output_cap_limits_huge_output() {
+        let (proxy, _dir) = isolated_proxy();
+        // Build a ~1.3MB string: 24 lines, each ~55KB
+        let line = "a".repeat(55000);
+        let output = (0..24).map(|i| format!("line {i}: {line}")).collect::<Vec<_>>().join("\n");
+        
+        let result = proxy.intercept_output("huge_cmd", &output);
+        
+        let tokens = proxy.engine.count_tokens(&result);
+        assert!(tokens <= 8100, "expected tokens <= 8100, got {tokens}");
+        assert!(result.contains("chars omitted"), "expected 'chars omitted' in output");
+        assert!(result.ends_with(&format!("[full output: sqz expand {}]", &sqz_engine::CacheManager::sha256_hex(output.as_bytes())[..16])), "should end with expand hint");
     }
 
     #[test]
@@ -1322,11 +1662,15 @@ mod tests {
         let (proxy, _dir) = isolated_proxy();
         let sha = unique_sha();
 
+        // Two non-index tokens per line (module name and layer word) so the
+        // indexed-row compaction stage does not fold these rows: it fires on
+        // rows that differ in one token, or in two that both end in digits.
+        // This test is about the abbreviator, not about row folding.
         let output = format!(
-            "Resolving dependencies for revision {sha} in module-a\n\
-             Resolving dependencies for revision {sha} in module-b\n\
-             Resolving dependencies for revision {sha} in module-c\n\
-             Resolving dependencies for revision {sha} in module-d\n"
+            "Resolving dependencies for revision {sha} in module-a (layer one)\n\
+             Resolving dependencies for revision {sha} in module-b (layer two)\n\
+             Resolving dependencies for revision {sha} in module-c (layer three)\n\
+             Resolving dependencies for revision {sha} in module-d (layer four)\n"
         );
 
         let opts = InterceptOptions { no_cache: false, abbreviate: false, ..InterceptOptions::default() };
@@ -1365,10 +1709,14 @@ mod tests {
         // what the abbreviator should fold.
         let tag = unique_sha();
         let phrase = format!("recurring diagnostic phrase with extra words {tag} marker");
-        // Enough repetitions that abbreviation clears the net-win gate.
-        let output: String = (0..12)
-            .map(|i| format!("{phrase} occurrence number {i}\n"))
-            .collect();
+        // Enough repetitions that abbreviation clears the net-win gate. A
+        // distinct line between repetitions keeps the indexed-row stage from
+        // folding the block first, which is what this test is not about.
+        let mut output = String::new();
+        for i in 0..12 {
+            output.push_str(&format!("{phrase} during step {i}\n"));
+            output.push_str(&format!("trailing note {i} for a different writer\n"));
+        }
 
         // Explicit default — abbreviation enabled.
         let opts = InterceptOptions::default();

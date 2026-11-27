@@ -1,8 +1,8 @@
 /// Two-pass compression verifier.
 ///
 /// After compression, the verifier checks that critical information was
-/// preserved. If confidence is below the threshold, it signals the caller
-/// to fall back to a safer (less aggressive) compression mode.
+/// preserved. Any failed invariant signals the caller to fall back to a safer
+/// (less aggressive) compression mode.
 ///
 /// Checks performed:
 /// 1. Required JSON keys present (if original was JSON)
@@ -18,12 +18,14 @@
 ///    class — the idea (post-compression preservation check) was prompted
 ///    by caveman-compress's validate.py, but the scan mechanism, inputs,
 ///    and integration point are sqz-specific.
+///
+/// Omission rule: content may be dropped only when the output declares it with
+/// a count (`[N segments omitted]`, `[×N similar lines]`, `...+N more`). Under
+/// a declaration, checks 3 and 7 require preservation only of lines that carry
+/// diagnostic signal; without one they require everything.
 
 use crate::text_search;
 use crate::types::VerifyResult;
-
-/// Confidence threshold below which fallback is triggered.
-const FALLBACK_THRESHOLD: f64 = 0.6;
 
 pub struct Verifier;
 
@@ -31,13 +33,42 @@ impl Verifier {
     /// Run all invariant checks on `original` → `compressed`.
     ///
     /// Returns a `VerifyResult` with confidence score and check details.
-    /// If `result.confidence < FALLBACK_THRESHOLD`, the caller should
-    /// re-compress with a safer preset.
+    /// If any check failed, `result.fallback_triggered` is set and the caller
+    /// should re-compress with a safer preset.
     pub fn verify(original: &str, compressed: &str) -> VerifyResult {
         let mut passed = Vec::new();
         let mut failed = Vec::new();
 
-        // Check 1: Minimum content retention (output must be ≥ 10% of input length)
+        // Omission declaration. A reduction is allowed to drop content only
+        // when the output says it did (`[110 low-information segments
+        // omitted]`, `[... 4000 chars omitted ...]`, `[×119 similar lines]`).
+        // That marker is the difference between a summary and a silent loss:
+        // the reader knows the rest exists and can ask for it. When the marker
+        // is present, the content checks are scoped to the lines that must
+        // survive no matter what (`carries_signal`); when it is absent,
+        // everything the input contained is still required.
+        let declared_omission = declares_omission(compressed);
+        // Declared template blocks are an invertible encoding: the block names
+        // its row count, prints the row template once with `%` per variable
+        // field, and lists each row's values in field order. Expanding them
+        // before the content checks keeps every invariant strict (nothing may
+        // be missing) while letting forty rows that share one message collapse
+        // to that message plus their forty locations. A malformed block is left
+        // unexpanded, so a buggy stage cannot use a bogus block to launder a
+        // loss: the expansion has to reproduce the original strings or the
+        // checks still fail.
+        let expanded = crate::template_collapse::expand_declared_templates(compressed);
+        let search = expanded.as_str();
+        let must_survive: Vec<&str> = if declared_omission {
+            original
+                .lines()
+                .filter(|line| carries_signal(line))
+                .collect()
+        } else {
+            original.lines().collect()
+        };
+
+        // Check 1: Content retention (advisory): how much smaller the output is.
         let retention = if original.is_empty() {
             1.0
         } else {
@@ -65,7 +96,7 @@ impl Verifier {
             passed.push("error_lines".to_string());
         } else {
             let trimmed: Vec<&str> = error_lines.iter().map(|l| l.trim()).collect();
-            let missing = text_search::present(compressed, &trimmed)
+            let missing = text_search::present(search, &trimmed)
                 .iter()
                 .filter(|&&p| !p)
                 .count();
@@ -80,8 +111,14 @@ impl Verifier {
         }
 
         // Check 3: File paths preserved (lines containing / or \ with extension)
-        let path_lines: Vec<&str> = original
-            .lines()
+        //
+        // Scoped by `must_survive`: a declared omission may drop the path on a
+        // plain data row (`tests/test_db.py::test_x PASSED`), never the path on
+        // a failure or a `path:line` location — those are how the reader finds
+        // the broken code.
+        let path_lines: Vec<&str> = must_survive
+            .iter()
+            .copied()
             .filter(|l| {
                 (l.contains('/') || l.contains('\\'))
                     && l.chars().any(|c| c == '.')
@@ -99,7 +136,7 @@ impl Verifier {
                     let token = line.split_whitespace()
                         .find(|t| t.contains('/') || t.contains('\\'))
                         .unwrap_or("");
-                    !token.is_empty() && !compressed.contains(token)
+                    !token.is_empty() && !search.contains(token)
                 })
                 .count();
             if missing_paths == 0 {
@@ -113,18 +150,24 @@ impl Verifier {
         }
 
         // Check 4: JSON key preservation (if original is JSON)
-        // We check that the compressed output contains at least 50% of the
-        // original top-level keys. Intentionally stripped keys are expected to be absent.
+        //
+        // Only keys that carry a payload are required. Projection is allowed
+        // to drop nulls, empty collections/strings, and bookkeeping ids
+        // (`request_id`, `etag`, ...); counting those as losses made every
+        // ordinary API payload fail the check the moment the threshold became
+        // a hard gate. Retention is still measured as a 50% ratio so a
+        // representation that legitimately merges nested keys (TOON tables)
+        // is not rejected for being a different shape.
         let orig_trimmed = original.trim();
         if orig_trimmed.starts_with('{') || orig_trimmed.starts_with('[') {
             if let Ok(orig_val) = serde_json::from_str::<serde_json::Value>(orig_trimmed) {
-                let orig_keys = collect_top_level_keys(&orig_val);
+                let orig_keys = required_top_level_keys(&orig_val);
                 if orig_keys.is_empty() {
                     passed.push("json_keys".to_string());
                 } else {
                     let present: usize = orig_keys
                         .iter()
-                        .filter(|&&k| compressed.contains(k))
+                        .filter(|&&k| search.contains(k))
                         .count();
                     let retention_ratio = present as f64 / orig_keys.len() as f64;
                     // Pass if at least 50% of original keys are present
@@ -133,7 +176,7 @@ impl Verifier {
                     } else {
                         let missing: Vec<&str> = orig_keys
                             .iter()
-                            .filter(|&&k| !compressed.contains(k))
+                            .filter(|&&k| !search.contains(k))
                             .copied()
                             .collect();
                         failed.push((
@@ -159,7 +202,7 @@ impl Verifier {
         if hunk_headers.is_empty() {
             passed.push("diff_hunks".to_string());
         } else {
-            let missing_hunks = text_search::present(compressed, &hunk_headers)
+            let missing_hunks = text_search::present(search, &hunk_headers)
                 .iter()
                 .filter(|&&p| !p)
                 .count();
@@ -174,17 +217,26 @@ impl Verifier {
         }
 
         // Check 6: Numeric values preserved (spot-check first 10 numbers)
-        let numbers: Vec<&str> = original
-            .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-            .filter(|s| !s.is_empty() && s.len() >= 2 && s.parse::<f64>().is_ok())
-            .take(10)
-            .collect();
+        //
+        // Two calibrations keep this from rejecting reductions it should
+        // accept, without loosening the rule for content that survives:
+        //
+        // - Standalone literals only. Digits glued to letters or underscores
+        //   (`req_7f3a9c21`, `filler-11`, `v1.2.3`) are identifier fragments;
+        //   the preservation check already covers those identifiers.
+        // - A number is only required when the line that carried it is still
+        //   represented in the output. Formatters are supposed to drop noise
+        //   lines such as a build timing (`... in 7.42s`) or a progress count
+        //   (`running 300 tests`); demanding those numbers made every cargo
+        //   test formatter trip the gate. When the line survived, its numbers
+        //   must survive with it.
+        let numbers = numbers_on_surviving_lines(original, search, declared_omission);
         if numbers.is_empty() {
             passed.push("numeric_values".to_string());
         } else {
             let missing_nums = numbers
                 .iter()
-                .filter(|&&n| !compressed.contains(n))
+                .filter(|&&n| !search.contains(n))
                 .count();
             if missing_nums == 0 {
                 passed.push("numeric_values".to_string());
@@ -207,12 +259,21 @@ impl Verifier {
         // into a `§ref:…§` marker intentionally, and (2) the scanner is
         // heuristic and may flag a token that the pipeline legitimately
         // rewrote (e.g. long base64 truncated by entropy_truncate).
-        let preservation_tokens = extract_preservation_tokens(original);
+        //
+        // Scoped the same way as `file_paths`: under a declared omission the
+        // scan covers the surviving signal lines, because the omitted block is
+        // explicitly accounted for by its marker and identifier factsheet.
+        let preservation_source: String = if declared_omission {
+            must_survive.join("\n")
+        } else {
+            original.to_string()
+        };
+        let preservation_tokens = extract_preservation_tokens(&preservation_source);
         if preservation_tokens.is_empty() {
             passed.push("preservation".to_string());
         } else {
             let tokens: Vec<&str> = preservation_tokens.iter().map(String::as_str).collect();
-            let hits = text_search::present(compressed, &tokens);
+            let hits = text_search::present(search, &tokens);
             let present = hits.iter().filter(|&&p| p).count();
             let total = preservation_tokens.len();
             let ratio = present as f64 / total as f64;
@@ -236,15 +297,16 @@ impl Verifier {
             }
         }
 
-        // Compute confidence: ratio of passed checks to total checks.
+        // Compute confidence: ratio of passed checks to total checks. This is
+        // diagnostic only — it says how much of the invariant set survived, not
+        // whether the output is safe to show.
         //
         // Special case: preservation is a "sentinel" check. If it fails, the
         // LLM will likely try to dereference a token (filename, URL, identifier)
         // that no longer exists in the compressed output, which causes
         // cascading failures in agent sessions (the exact bug class that
         // produced fixes fd4603d, f6dc86c, b8bd0d7). Cap confidence at 0.5
-        // when preservation fails so that the fallback kicks in even when
-        // the other 6 checks pass.
+        // when preservation fails so the number reads as "do not trust this".
         let total = passed.len() + failed.len();
         let mut confidence = if total == 0 {
             1.0
@@ -256,7 +318,21 @@ impl Verifier {
             confidence = confidence.min(0.5);
         }
 
-        let fallback_triggered = confidence < FALLBACK_THRESHOLD;
+        // Every content check is a hard invariant: a single failure means the
+        // output lost something the caller asked us to keep. Averaging used to
+        // let one failure through at 5/6 = 0.83, well above the old 0.6
+        // threshold, so a missing file path or dropped error line shipped
+        // silently.
+        //
+        // `min_retention` is the one advisory check. Shrinking a 120-line log
+        // to one representative line plus a fold marker is a 3% ratio and the
+        // *correct* result; the content checks are what prove nothing was
+        // lost. Retention stays in `checks_failed` as a diagnostic and as a
+        // confidence penalty, but it does not send the caller back to lossless.
+        const ADVISORY_CHECKS: [&str; 1] = ["min_retention"];
+        let fallback_triggered = failed
+            .iter()
+            .any(|(check, _)| !ADVISORY_CHECKS.contains(&check.as_str()));
 
         VerifyResult {
             passed: failed.is_empty(),
@@ -271,13 +347,289 @@ impl Verifier {
     pub fn should_fallback(result: &VerifyResult) -> bool {
         result.fallback_triggered
     }
+
+    /// Invariants for a per-command formatter's output. Empty means the
+    /// formatter kept its contract.
+    ///
+    /// A formatter is not the pipeline. Its job is to drop noise (progress
+    /// lines, per-test `ok` rows, build timings), so the retention and
+    /// preservation checks that keep the pipeline honest would reject every
+    /// legitimate formatter. What a formatter may never do is drop or rewrite
+    /// a line that carries diagnostic signal: that is the loss the Safe-route
+    /// gate exists to catch.
+    ///
+    /// Lines are compared trimmed, so re-indenting a trace is allowed.
+    pub fn formatter_losses(original: &str, formatted: &str) -> Vec<String> {
+        let haystack: Vec<&str> = formatted.lines().map(str::trim).collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for line in original.lines() {
+            if !carries_signal(line) {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || haystack.contains(&trimmed) {
+                continue;
+            }
+            if !missing.contains(&trimmed) {
+                missing.push(trimmed);
+            }
+        }
+        if missing.is_empty() {
+            Vec::new()
+        } else {
+            let sample: Vec<&str> = missing.iter().take(3).copied().collect();
+            vec![format!(
+                "{} signal line(s) dropped or rewritten, e.g. {:?}",
+                missing.len(),
+                sample
+            )]
+        }
+    }
 }
 
-fn collect_top_level_keys(value: &serde_json::Value) -> Vec<&str> {
-    match value {
-        serde_json::Value::Object(map) => map.keys().map(|k| k.as_str()).collect(),
-        _ => vec![],
+/// Whether `compressed` declares that content was dropped.
+///
+/// Only markers sqz itself emits count. Each one names the quantity that went
+/// missing, so a reader can tell "this is a summary of 5840 bytes" from "this
+/// is all 5840 bytes":
+///
+///   - `[110 low-information segments omitted]` (entropy truncator)
+///   - `[... 4000 chars omitted: output exceeded the 8000-token cap ...]`
+///   - `[×119 similar lines folded]` (log template fold)
+///   - `// ... 12 lines omitted ...` / `...+7 more` (list truncation)
+///
+/// Requires the bracket/paren form rather than a bare word, so a compiler
+/// message that happens to contain "truncated" cannot license a silent loss.
+fn declares_omission(compressed: &str) -> bool {
+    for line in compressed.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        let marked = trimmed.starts_with('[')
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("...+")
+            || trimmed.starts_with('…');
+        if !marked {
+            continue;
+        }
+        if lower.contains("omitted")
+            || lower.contains("similar lines")
+            || lower.contains("elided")
+            || lower.contains("lines folded")
+            || lower.contains("chars hidden")
+        {
+            return true;
+        }
     }
+    false
+}
+
+/// Whether `line` carries diagnostic signal a formatter must not drop.
+///
+/// Deliberately narrow: failure wording, error/exception markers, and
+/// `path:line:col` locations. Everything else is noise a formatter may drop.
+fn carries_signal(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const MARKERS: [&str; 12] = [
+        "error",
+        "warning",
+        "fatal",
+        "panic",
+        "exception",
+        "failed",
+        "failure",
+        "assert",
+        "traceback",
+        "backtrace",
+        "stack trace",
+        "<<<",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) && has_content_beyond_markers(line, &MARKERS) {
+        return true;
+    }
+    has_source_location(line)
+}
+
+/// Whether `line` says anything besides the marker word itself.
+///
+/// A bare `failures:` or `FAILURE:` heading is structural noise a formatter may
+/// collapse into its own section header; the lines under it are what matter.
+/// Strip every marker word and see whether four alphabetic characters survive.
+fn has_content_beyond_markers(line: &str, markers: &[&str]) -> bool {
+    let mut rest = line.to_lowercase();
+    for marker in markers {
+        rest = rest.replace(marker, " ");
+    }
+    let bytes = rest.as_bytes();
+    let mut run = 0;
+    for &b in bytes {
+        if b.is_ascii_alphabetic() {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// Whether `line` contains a `path:line[:col]` style source location.
+fn has_source_location(line: &str) -> bool {
+    for token in line.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| c == ',' || c == ')' || c == '(' || c == ';');
+        let mut parts = trimmed.rsplit(':');
+        let mut digits = 0;
+        for _ in 0..2 {
+            match parts.next() {
+                Some(part) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => {
+                    digits += 1
+                }
+                _ => break,
+            }
+        }
+        if digits > 0 && parts.next().is_some_and(|rest| rest.contains('.')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Top-level keys whose value the projection is not allowed to drop.
+fn required_top_level_keys(value: &serde_json::Value) -> Vec<&str> {
+    let strip_names = crate::json_projection::ProjectionConfig::default().strip_names;
+    let map = match value {
+        serde_json::Value::Object(map) => map,
+        _ => return vec![],
+    };
+    map.iter()
+        .filter(|(name, value)| {
+            let bookkeeping = strip_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name));
+            !bookkeeping && carries_payload(value)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
+/// `null`, `""`, `[]` and `{}` are placeholders, not payload.
+fn carries_payload(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+        _ => true,
+    }
+}
+
+/// Numeric literals whose loss would mean corruption rather than omission.
+///
+/// A literal is standalone when the character on either side is not part of an
+/// identifier, so `1200 ms` counts and `req_7f3a9c21` does not.
+///
+/// Two scoping rules, chosen by whether the output declares an omission:
+///
+/// - No declaration: a line counts as surviving when its longest alphabetic
+///   token appears in the output. Words intact with numbers gone is exactly the
+///   corruption signature this check exists for (`fetched 3 packages in 1200
+///   ms` → `fetched packages in ms`).
+/// - Declared omission: only signal lines supply required numbers. A token
+///   anchor cannot work on summarised bulk data, because 300 test rows share
+///   the token `tests` and 300 progress bars share `PASSED`, so the anchor
+///   would demand every counter in the block that the declaration just said
+///   was left out. Signal lines must survive any reduction, so their numbers
+///   are always required.
+///
+/// The check is a spot check, not a proof. Stages that re-encode wholesale
+/// (TOON, projection) reformat lines, so containment does not hold and the JSON
+/// key check is what holds them to account.
+fn numbers_on_surviving_lines<'a>(
+    original: &'a str,
+    compressed: &str,
+    declared_omission: bool,
+) -> Vec<&'a str> {
+    const MAX_CHECKED: usize = 10;
+
+    let mut out: Vec<&'a str> = Vec::new();
+    for line in original.lines() {
+        let signal = carries_signal(line);
+        let survived = if declared_omission {
+            signal
+        } else {
+            signal
+                || longest_alpha_token(line).is_some_and(|anchor| compressed.contains(anchor))
+        };
+        if !survived {
+            continue;
+        }
+        for number in standalone_numbers(line) {
+            if out.len() >= MAX_CHECKED {
+                return out;
+            }
+            if !out.contains(&number) {
+                out.push(number);
+            }
+        }
+    }
+    out
+}
+
+/// Longest run of ASCII letters in `line`, used as the line's fingerprint.
+fn longest_alpha_token(line: &str) -> Option<&str> {
+    let mut best: Option<&str> = None;
+    let mut start = 0;
+    let bytes = line.as_bytes();
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_alphabetic() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+            end += 1;
+        }
+        if end - start >= 3 {
+            let token = &line[start..end];
+            if best.is_none_or(|b| token.len() > b.len()) {
+                best = Some(token);
+            }
+        }
+        start = end;
+    }
+    best
+}
+
+/// Standalone numeric literals in `text` (see `numbers_on_surviving_lines`).
+fn standalone_numbers(text: &str) -> Vec<&str> {
+    let is_num = |c: u8| c.is_ascii_digit() || c == b'.' || c == b'-';
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_num(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_num(bytes[i]) {
+            i += 1;
+        }
+        let end = i;
+        let glued_left = start > 0 && is_ident(bytes[start - 1]);
+        let glued_right = end < bytes.len() && is_ident(bytes[end]);
+        if glued_left || glued_right {
+            continue;
+        }
+        if let Some(literal) = text.get(start..end) {
+            if literal.len() >= 2 && literal.parse::<f64>().is_ok() {
+                out.push(literal);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

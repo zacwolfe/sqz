@@ -45,12 +45,18 @@ impl ToonEncoder {
 
     /// Return true if `input` looks like valid JSON.
     /// Used by the pipeline to decide whether to apply TOON encoding.
+    ///
+    /// The parse runs on the text as given, not on a trimmed copy: every
+    /// caller parses the same untrimmed text afterwards, and Rust's `trim`
+    /// strips characters JSON does not treat as whitespace (a leading
+    /// vertical tab, for example). Trimming here made `"\u{b}0"` look like
+    /// JSON, and the caller's own parse then failed with `expected value at
+    /// line 1 column 1` instead of leaving the text alone.
     pub fn is_json(input: &str) -> bool {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
+        if input.trim().is_empty() {
             return false;
         }
-        serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+        serde_json::from_str::<serde_json::Value>(input).is_ok()
     }
 }
 
@@ -912,6 +918,16 @@ mod tests {
     #[test]
     fn is_json_whitespace_trimmed() {
         assert!(ToonEncoder::is_json("  { \"a\": 1 }  "));
+    }
+
+    #[test]
+    fn is_json_rejects_whitespace_json_cannot_skip() {
+        // `trim` removes these, serde_json does not. Callers parse the text
+        // untrimmed, so detecting it as JSON here turned a valid passthrough
+        // into a serialization error.
+        assert!(!ToonEncoder::is_json("\u{b}0"));
+        assert!(!ToonEncoder::is_json("{\"a\":1}\u{c}"));
+        assert!(ToonEncoder::is_json("\n{\"a\":1}\n"));
     }
 
     // ---------------------------------------------------------------------------

@@ -43,6 +43,25 @@ use crate::error::{Result, SqzError};
 /// ```
 pub struct PresetParser;
 
+/// The TOML text `sqz init` writes to `~/.sqz/presets/default.toml`.
+///
+/// Generated from [`Preset::default`] rather than hand-written so the file
+/// can never drift from the schema [`PresetParser`] parses. The CLI and the
+/// shell hook compress with the preset compiled into the binary; this file
+/// is what `sqz-mcp --preset-dir <dir>` loads.
+pub fn default_preset_toml() -> String {
+    let mut text = String::from(
+        "# Written by sqz init. The CLI and the shell hook use the preset\n\
+         # compiled into the binary; sqz-mcp reads this file when started with\n\
+         # --preset-dir. Edit a copy rather than this one.\n\n",
+    );
+    match PresetParser::to_toml(&Preset::default()) {
+        Ok(body) => text.push_str(&body),
+        Err(_) => text.push_str("# preset serialization failed\n"),
+    }
+    text
+}
+
 impl PresetParser {
     /// Parse a TOML string into a validated `Preset`.
     pub fn parse(toml_str: &str) -> Result<Preset> {
@@ -162,6 +181,34 @@ pub struct CompressionConfig {
     pub truncate_strings: Option<TruncateStringsConfig>,
     pub collapse_arrays: Option<CollapseArraysConfig>,
     pub custom_transforms: Option<CustomTransformsConfig>,
+    pub json_projection: Option<JsonProjectionConfig>,
+    /// Override the entropy-truncation threshold for non-benign output (bytes).
+    #[serde(default)]
+    pub entropy_threshold: Option<usize>,
+    /// Override the entropy-truncation threshold for benign output (bytes).
+    #[serde(default)]
+    pub benign_entropy_threshold: Option<usize>,
+    /// Override the final output token cap.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Controls schema-aware JSON projection (strip low-value fields,
+/// optionally summarize deeply nested objects).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonProjectionConfig {
+    pub enabled: bool,
+    /// Replace objects nested deeper than `max_depth` with a lossy
+    /// `{...N keys}` summary. DELETES the real subtree — off by default
+    /// so structured API payloads keep their values.
+    #[serde(default)]
+    pub summarize_deep: bool,
+    #[serde(default = "default_projection_max_depth")]
+    pub max_depth: u32,
+}
+
+fn default_projection_max_depth() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +455,14 @@ impl Default for Preset {
                     summary_template: "... and {remaining} more items".to_string(),
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
+                json_projection: Some(JsonProjectionConfig {
+                    enabled: true,
+                    summarize_deep: false,
+                    max_depth: 8,
+                }),
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
@@ -446,6 +501,39 @@ impl Default for Preset {
             },
         }
     }
+}
+
+/// Derive an aggressive compression preset from an existing one.
+///
+/// Tightens truncation thresholds and the output cap, and enables the
+/// deepest available lossy reductions. The returned preset keeps every
+/// other setting from `base`.
+pub fn aggressive_preset(base: &Preset) -> Preset {
+    let mut preset = base.clone();
+    preset.preset.name = "aggressive".to_string();
+    preset.preset.description =
+        "Maximum compression: lower truncation thresholds, smaller output cap".to_string();
+
+    preset.compression.entropy_threshold = Some(200);
+    preset.compression.benign_entropy_threshold = Some(500);
+    preset.compression.max_output_tokens = Some(4000);
+
+    if let Some(ref mut t) = preset.compression.truncate_strings {
+        t.max_length = 200;
+    }
+    if let Some(ref mut c) = preset.compression.collapse_arrays {
+        c.max_items = 3;
+    }
+    if let Some(ref mut c) = preset.compression.condense {
+        c.max_repeated_lines = 2;
+    }
+    preset.compression.json_projection = Some(JsonProjectionConfig {
+        enabled: true,
+        summarize_deep: true,
+        max_depth: 4,
+    });
+
+    preset
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +632,10 @@ mod tests {
                     truncate_strings: None,
                     collapse_arrays: None,
                     custom_transforms: None,
+                    json_projection: None,
+                    entropy_threshold: None,
+                    benign_entropy_threshold: None,
+                    max_output_tokens: None,
                 },
                 tool_selection,
                 budget,
@@ -753,5 +845,50 @@ mod tests {
                 err_msg
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod preset_file_tests {
+    use super::*;
+
+    /// The file `sqz init` writes must load back through the same parser
+    /// `sqz-mcp --preset-dir` uses. A hand-written template drifted from the
+    /// serde schema once already (`[meta]` instead of `[preset]`), which made
+    /// the written file unloadable.
+    #[test]
+    fn default_preset_toml_parses_back() {
+        let text = default_preset_toml();
+        let parsed = PresetParser::parse(&text).expect("generated default preset must parse");
+        let default = Preset::default();
+        assert_eq!(parsed.preset.name, default.preset.name);
+        assert_eq!(
+            parsed.compression.max_output_tokens,
+            default.compression.max_output_tokens
+        );
+        assert_eq!(
+            parsed
+                .compression
+                .json_projection
+                .as_ref()
+                .map(|c| (c.enabled, c.summarize_deep, c.max_depth)),
+            default
+                .compression
+                .json_projection
+                .as_ref()
+                .map(|c| (c.enabled, c.summarize_deep, c.max_depth))
+        );
+    }
+
+    /// `max_output_tokens` is the knob people reach for, and it must stay
+    /// unset in the default file: the cap comes from the compiled-in
+    /// `size_cap::DEFAULT_MAX_TOKENS`.
+    #[test]
+    fn default_preset_toml_leaves_the_cap_unset() {
+        let text = default_preset_toml();
+        assert!(
+            !text.contains("max_output_tokens"),
+            "default preset should not pin the output cap:\n{text}"
+        );
     }
 }

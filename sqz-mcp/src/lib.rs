@@ -15,7 +15,7 @@
 //! | Tool | Purpose |
 //! |---|---|
 //! | `sqz_read_file` | Read a file faithfully; a repeat read of unchanged content returns a ~13-token `§ref:HASH§`, a re-read after a small edit returns a line-level delta. Output is capped at 256 KB, cut on a line boundary, with `continue_with_offset` in the header |
-//! | `sqz_grep` | Literal or regex search, `path:lineno:text` output, capped at `max_matches` hits and 100 KB; lines over 400 chars are clipped around the hit |
+//! | `sqz_grep` | Literal or regex search, `path:lineno:text` output, paged via `offset`/`max_matches` and capped at 100 KB; lines over 400 chars are clipped around the hit |
 //! | `sqz_list_dir` | Directory listing that skips `.git`, `node_modules`, `target`, `dist`, `build`, `vendor`; capped at 1000 entries |
 //! | `compress` | Run arbitrary text through the full sqz pipeline (per-command formatters, log folding, JSON compaction, session dedup) |
 //! | `passthrough` | Return text unchanged (escape hatch for models that cannot parse `§ref§` tokens) |
@@ -287,13 +287,19 @@ impl McpServer {
 
     /// Log a compression event to the session store so `sqz gain` and
     /// `sqz stats` reflect MCP-path savings.
-    fn log_compression(&self, tool_id: &str, tokens_original: u32, tokens_compressed: u32) {
+    fn log_compression(
+        &self,
+        tool_id: &str,
+        tokens_original: u32,
+        tokens_compressed: u32,
+        stages: &[String],
+    ) {
         let project = std::env::current_dir().ok();
         let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
         let _ = self.engine.session_store().log_compression_with_project(
             tokens_original,
             tokens_compressed,
-            &[],
+            stages,
             tool_id,
             project_str.as_deref(),
         );
@@ -316,18 +322,21 @@ impl McpServer {
 
         let compressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let tokens_original = self.engine.count_tokens(&raw_input);
-            self.compress_cached(&raw_input, tokens_original, false, true)
-                .map(|(output, tokens_compressed)| (output, tokens_original, tokens_compressed))
+            self.compress_cached(&raw_input, tokens_original, false, true).map(
+                |(output, tokens_compressed, stages)| {
+                    (output, tokens_original, tokens_compressed, stages)
+                },
+            )
         }));
-        let (output, tokens_original, tokens_compressed) = match compressed {
+        let (output, tokens_original, tokens_compressed, stages) = match compressed {
             Ok(result) => result?,
             Err(_) => {
                 self.engine.clear_poison();
                 let tokens = estimate_tokens(&raw_input);
-                (raw_input, tokens, tokens)
+                (raw_input, tokens, tokens, Vec::new())
             }
         };
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         Ok(ToolCallResponse {
             tool_id: request.tool_id,
@@ -506,7 +515,7 @@ impl McpServer {
     /// Repeat reads got pipeline compression (~30%), not dedup refs
     /// (~92%). Routing through `engine.compress_with_cache()` restores
     /// the advertised behaviour.
-    fn compress_cached(&self, text: &str, tokens: u32, lossless: bool, allow_delta: bool) -> Result<(String, u32)> {
+    fn compress_cached(&self, text: &str, tokens: u32, lossless: bool, allow_delta: bool) -> Result<(String, u32, Vec<String>)> {
         use sqz_engine::CacheResult;
         #[cfg(test)]
         tests::maybe_panic();
@@ -519,33 +528,38 @@ impl McpServer {
         };
         let tiny = tokens <= REF_TOKENS;
         Ok(match result {
-            CacheResult::Dedup { inline_ref, token_cost } if !tiny => (inline_ref, token_cost),
-            CacheResult::Delta { delta_text, token_cost, .. } if allow_delta && !tiny => (delta_text, token_cost),
+            CacheResult::Dedup { inline_ref, token_cost } if !tiny => {
+                (inline_ref, token_cost, vec!["dedup".to_string()])
+            }
+            CacheResult::Delta { delta_text, token_cost, .. } if allow_delta && !tiny => {
+                (delta_text, token_cost, vec!["delta".to_string()])
+            }
             CacheResult::Dedup { .. } | CacheResult::Delta { .. } => return self.compress_fresh(text, lossless),
             CacheResult::Fresh { output } => {
-                let lossy = output.stages_applied.iter().any(|s| s == "entropy_truncate" || s == "toon_encode");
+                let stages = output.stages_applied;
+                let lossy = stages.iter().any(|s| s == "entropy_truncate" || s == "toon_encode");
                 if lossy && !self.engine.never_store(text) {
                     let hash = sqz_engine::CacheManager::sha256_hex(text.as_bytes());
                     let data = format!("{}\n[full output: call expand with prefix \"{}\"]", output.data, &hash[..16]);
                     match self.engine.count_tokens(&data) {
-                        cost if cost < tokens => (data, cost),
-                        _ => (text.to_string(), tokens),
+                        cost if cost < tokens => (data, cost, stages),
+                        _ => (text.to_string(), tokens, Vec::new()),
                     }
                 } else {
-                    (output.data, output.tokens_compressed)
+                    (output.data, output.tokens_compressed, stages)
                 }
             }
         })
     }
 
     /// What `compress_cached` returns on a cache miss, without the cache.
-    fn compress_fresh(&self, text: &str, lossless: bool) -> Result<(String, u32)> {
+    fn compress_fresh(&self, text: &str, lossless: bool) -> Result<(String, u32, Vec<String>)> {
         let output = if lossless {
             self.engine.compress_lossless(text)?
         } else {
             self.engine.compress(text)?
         };
-        Ok((output.data, output.tokens_compressed))
+        Ok((output.data, output.tokens_compressed, output.stages_applied))
     }
 
     /// Read a file from disk and return the content compressed.
@@ -662,7 +676,7 @@ impl McpServer {
         };
 
         let tokens_original = self.engine.count_tokens(&raw_text);
-        let (compressed_data, tokens_compressed) =
+        let (compressed_data, tokens_compressed, stages) =
             self.compress_cached(&raw_text, tokens_original, true, range.is_none())?;
 
         // Attach a small header so the agent knows where the content
@@ -683,7 +697,7 @@ impl McpServer {
         }
         let output = format!("{header}]\n{compressed_data}");
 
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         Ok(ToolCallResponse {
             tool_id: request.tool_id,
@@ -732,8 +746,8 @@ impl McpServer {
 
         let raw = listing.lines.join("\n");
         let tokens_original = self.engine.count_tokens(&raw);
-        let (compressed_data, tokens_compressed) = self.compress_cached(&raw, tokens_original, true, true)?;
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        let (compressed_data, tokens_compressed, stages) = self.compress_cached(&raw, tokens_original, true, true)?;
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         let mut header = format!(
             "[sqz_list_dir path={} entries={}",
@@ -770,6 +784,10 @@ impl McpServer {
     ///   `{ "pattern": "TODO", "path": "src" }`
     ///   `{ "pattern": "fn \\w+_test", "path": ".", "regex": true }`
     ///   `{ "pattern": "use serde", "path": "src", "max_matches": 50 }`
+    ///   `{ "pattern": "use serde", "path": "src", "max_matches": 50, "offset": 50 }`
+    ///
+    /// `offset` skips that many matches before collecting the page, so a
+    /// capped search can be paged instead of re-run with a wider cap.
     fn handle_sqz_grep(&mut self, request: ToolCallRequest) -> Result<ToolCallResponse> {
         let pattern = request
             .input
@@ -795,6 +813,11 @@ impl McpServer {
                 .unwrap_or(200) as usize,
             max_line_chars: cap_from(&request.input, "max_line_chars", GREP_DEFAULT_MAX_LINE_CHARS),
             max_bytes: cap_from(&request.input, "max_bytes", GREP_DEFAULT_MAX_BYTES),
+            offset: request
+                .input
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
         };
 
         let use_regex = request
@@ -825,15 +848,27 @@ impl McpServer {
 
         let raw = found.lines.join("\n");
         let tokens_original = self.engine.count_tokens(&raw);
-        let (compressed_data, tokens_compressed) = self.compress_cached(&raw, tokens_original, true, true)?;
-        self.log_compression(&request.tool_id, tokens_original, tokens_compressed);
+        let (compressed_data, tokens_compressed, stages) = self.compress_cached(&raw, tokens_original, true, true)?;
+        self.log_compression(&request.tool_id, tokens_original, tokens_compressed, &stages);
 
         let mut header = format!(
-            "[sqz_grep pattern={:?} root={} matches={}",
+            "[sqz_grep pattern={:?} root={} offset={} matches={}",
             pattern,
             root.display(),
+            limits.offset,
             found.lines.len(),
         );
+        // When the scan ran to completion we know the exact total; when a
+        // cap stopped it early all we can promise is that more may follow.
+        let truncated = found.byte_capped || found.lines.len() >= limits.max_matches;
+        if truncated {
+            header.push_str(&format!(
+                " truncated=true next_offset={}",
+                limits.offset + found.lines.len()
+            ));
+        } else {
+            header.push_str(&format!(" total_matches={}", found.total));
+        }
         if found.lines.len() >= limits.max_matches {
             header.push_str(&format!(" max_matches_reached={}", limits.max_matches));
         }
@@ -1424,8 +1459,13 @@ pub fn default_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "max_matches": {
                         "type": "integer",
-                        "description": "Stop after this many matches.",
+                        "description": "Return at most this many matches after skipping `offset`.",
                         "default": 200
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip this many matches before collecting the page; pass the previous `next_offset` to page.",
+                        "default": 0
                     },
                     "max_line_chars": {
                         "type": "integer",
@@ -1441,7 +1481,9 @@ pub fn default_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             compression_transforms: vec![
-                "max_matches: search stops after the cap (default 200); the header reports the match count".to_string(),
+                "max_matches: the page holds at most this many matches after `offset` (default 200); the header reports the count".to_string(),
+                "offset: matches before `offset` are skipped; the header reports `offset=` and, when capped, `next_offset=` to page".to_string(),
+                "total_matches: reported when the scan completed; `truncated=true` plus `next_offset=` means more matches remain".to_string(),
                 "max_line_chars: a match line over 400 chars is clipped around the hit and marked".to_string(),
                 "max_bytes: search stops at 100000 bytes of output; the header says so".to_string(),
                 "sha256_cache: repeat searches dedupe via §ref§".to_string(),
@@ -1723,6 +1765,8 @@ struct GrepLimits {
     max_matches: usize,
     max_line_chars: usize,
     max_bytes: usize,
+    /// Matches to skip before collecting the page.
+    offset: usize,
 }
 
 /// Matches collected so far, with what the caps cut.
@@ -1732,6 +1776,11 @@ struct GrepResults {
     bytes: usize,
     clipped: usize,
     byte_capped: bool,
+    /// Matches skipped by `offset` so far.
+    skipped: usize,
+    /// Every match seen by the scan (skipped and returned), used for
+    /// `total_matches` when the scan ran to completion.
+    total: usize,
 }
 
 impl GrepResults {
@@ -1739,10 +1788,15 @@ impl GrepResults {
         self.byte_capped || self.lines.len() >= limits.max_matches
     }
 
-    /// Add one match line unless it would push the output past the byte
-    /// cap. The first match is always kept so a capped search says what
-    /// it found.
+    /// Add one match line unless the offset still skips it or it would
+    /// push the output past the byte cap. The first returned match is
+    /// always kept so a capped search says what it found.
     fn push(&mut self, line: String, clipped: bool, limits: &GrepLimits) {
+        self.total += 1;
+        if self.skipped < limits.offset {
+            self.skipped += 1;
+            return;
+        }
         let cost = line.len() + 1;
         if !self.lines.is_empty() && self.bytes.saturating_add(cost) > limits.max_bytes {
             self.byte_capped = true;
@@ -3455,8 +3509,57 @@ complexity_threshold = 0.4
             intent: None,
         };
         let resp = server.handle_tool_call(req).expect("grep should succeed");
-        assert!(resp.output.contains("matches=10 max_matches_reached=10]"),
+        assert!(resp.output.contains("offset=0 matches=10"),
+            "page must report its offset and size; got: {}", resp.output);
+        assert!(resp.output.contains("max_matches_reached=10"),
             "should stop at max_matches; got: {}", resp.output);
+        assert!(resp.output.contains("truncated=true next_offset=10"),
+            "a capped page must tell the caller how to continue; got: {}", resp.output);
+    }
+
+    #[test]
+    fn test_sqz_grep_pages_with_offset() {
+        // A capped search can be continued with `offset=next_offset`
+        // instead of re-running a wider search from scratch. Pages must
+        // be disjoint and come back in the deterministic walk order.
+        let (mut server, dir) = make_server();
+        let content: String = (0..25).map(|i| format!("line {i}: needle\n")).collect();
+        std::fs::write(dir.path().join("many.txt"), content).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let first = grep(&mut server, serde_json::json!({
+            "pattern": "needle",
+            "path": path,
+            "max_matches": 10,
+        }));
+        let (header, body) = first.split_once('\n').unwrap();
+        assert!(header.contains("offset=0 matches=10"), "{header}");
+        assert!(header.contains("truncated=true next_offset=10"), "{header}");
+        assert!(body.contains("many.txt:1:") && body.contains("many.txt:10:"), "{body}");
+
+        let second = grep(&mut server, serde_json::json!({
+            "pattern": "needle",
+            "path": path,
+            "max_matches": 10,
+            "offset": 10,
+        }));
+        let (header, body) = second.split_once('\n').unwrap();
+        assert!(header.contains("offset=10 matches=10"), "{header}");
+        assert!(header.contains("truncated=true next_offset=20"), "{header}");
+        assert!(body.contains("many.txt:11:") && body.contains("many.txt:20:"), "{body}");
+        assert!(!body.contains("many.txt:10:") && !body.contains("many.txt:1:"), "{body}");
+
+        let last = grep(&mut server, serde_json::json!({
+            "pattern": "needle",
+            "path": path,
+            "max_matches": 10,
+            "offset": 20,
+        }));
+        let (header, body) = last.split_once('\n').unwrap();
+        assert!(header.contains("offset=20 matches=5"), "{header}");
+        assert!(header.contains("total_matches=25"), "a complete scan reports the total; got: {header}");
+        assert!(!header.contains("truncated=true"), "{header}");
+        assert!(body.contains("many.txt:21:") && body.contains("many.txt:25:"), "{body}");
     }
 
     fn grep(server: &mut McpServer, input: serde_json::Value) -> String {

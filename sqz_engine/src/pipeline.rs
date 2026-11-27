@@ -13,6 +13,7 @@ use crate::stages::{
 use crate::token_counter::TokenCounter;
 use crate::token_pruner::TokenPruner;
 use crate::toon::ToonEncoder;
+use crate::size_cap;
 use crate::types::{CompressedContent, Content, ContentType, ModelFamily, StageConfig};
 
 /// Minimal session context passed to the pipeline. Just carries the session
@@ -20,6 +21,14 @@ use crate::types::{CompressedContent, Content, ContentType, ModelFamily, StageCo
 pub struct SessionContext {
     pub session_id: String,
 }
+
+/// Items an array keeps at minimum when the token cap has to shrink a JSON
+/// payload by dropping elements, so a long array still shows its shape.
+const ARRAY_CAP_MIN_ITEMS: usize = 5;
+
+/// Summary line the array cap writes, matching the `collapse_arrays` stage so
+/// a count the stage already declared is folded in rather than dropped.
+const ARRAY_CAP_SUMMARY: &str = "... and {remaining} more items";
 
 /// The compression pipeline orchestrator.
 ///
@@ -170,6 +179,13 @@ impl CompressionPipeline {
         };
 
         let mut stages_applied: Vec<String> = Vec::new();
+        // Set when identical-change folding replaced repeated hunk bodies with
+        // reference lines. The fold is already the lossy step for that text and
+        // it is verifier-safe: it keeps every path and every `@@` header. A
+        // later entropy pass scores those short reference lines as redundant
+        // and drops half of them, which loses hunk headers the reader needs, so
+        // truncation is skipped once the fold has run.
+        let mut diff_folded = false;
         let mut condensed: Option<(String, String)> = None;
 
         for stage in &self.stages {
@@ -201,13 +217,44 @@ impl CompressionPipeline {
 
         // JSON projection: strip internal/debug fields, empty collections,
         // deep nesting, and redundant timestamps before other JSON processing
-        if !lossless && is_json && content.raw.len() > 100 {
-            let proj_config = crate::json_projection::ProjectionConfig::default();
+        let projection_enabled = preset
+            .compression
+            .json_projection
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(true);
+        if !lossless && is_json && content.raw.len() > 100 && projection_enabled {
+            let proj_config = match &preset.compression.json_projection {
+                Some(c) => crate::json_projection::ProjectionConfig {
+                    summarize_deep: c.summarize_deep,
+                    max_depth: c.max_depth as usize,
+                    ..Default::default()
+                },
+                None => crate::json_projection::ProjectionConfig::default(),
+            }
+            .with_env_overrides();
             if let Ok(proj_result) = crate::json_projection::project_json(&content.raw, &proj_config) {
                 if proj_result.fields_removed > 0 {
                     content.raw = proj_result.data;
                     stages_applied.push("json_projection".to_owned());
                 }
+            }
+        }
+
+        // Identical-change diff folding: a mechanical refactor repeats one hunk
+        // body across many files. The exemplar stays verbatim and every other
+        // file in the group becomes one reference line carrying its path and
+        // its `@@` headers, so the diff still says where every change landed.
+        // Bodies must be byte-identical (digits included), so nothing is masked
+        // or inferred. Runs before the generic stages so they see the folded
+        // buffer. Skipped on the lossless path.
+        if !lossless && !is_json && content.raw.len() > 400 {
+            if let Ok(Some(fold)) =
+                crate::rle_compressor::collapse_identical_diff_files(&content.raw, 3, 6)
+            {
+                content.raw = fold.text;
+                diff_folded = true;
+                stages_applied.push("diff_fold".to_owned());
             }
         }
 
@@ -251,6 +298,38 @@ impl CompressionPipeline {
             }
         }
 
+        // Indexed-row compaction: collapse runs of rows that differ only in an
+        // index or name field (test-runner rows, generated migrations, repeated
+        // statements). log_template only masks timestamps, so these rows never
+        // share a template and survive verbatim. The marker names the count and
+        // which field varied, so the loss is declared. Diff payload and signal
+        // lines are excluded inside the stage. Skipped on the lossless path.
+        if !lossless && !is_json && !is_code && content.raw.len() > 200 {
+            if let Ok(ir_result) = crate::rle_compressor::collapse_indexed_rows(&content.raw, 4) {
+                if ir_result.runs_collapsed > 0 {
+                    content.raw = ir_result.text;
+                    stages_applied.push("indexed_row_collapse".to_owned());
+                }
+            }
+        }
+
+        // Terminal progress coalescing: progress bars, transfer status rows,
+        // and repeated "Downloading ..." lines redraw one row or restate the
+        // same transient message. Every stage above keys on stable content
+        // (identical neighbours, masked timestamps, a varying index), so these
+        // lines survive all of them and are charged to the reader. The last
+        // redraw frame is what a terminal showed, and a run keeps its first
+        // line plus a declared count. Error lines and any run containing one
+        // are left untouched. Skipped on the lossless path.
+        if !lossless && !is_json && !is_code && content.raw.len() > 200 {
+            if let Ok(nr_result) = crate::noise_run::collapse_noise_runs(&content.raw, 4) {
+                if nr_result.lines_removed > 0 || nr_result.frames_collapsed > 0 {
+                    content.raw = nr_result.text;
+                    stages_applied.push("noise_run".to_owned());
+                }
+            }
+        }
+
         // Sliding window dedup: catch repeated substrings across non-adjacent lines.
         // Skipped on the lossless path — its `[→Ln]` back-references have no
         // agent-facing expand path and make a file read non-faithful (#32).
@@ -289,11 +368,17 @@ impl CompressionPipeline {
         // builds, passing test runs) gets 2x headroom before truncation
         // kicks in, since dropping detail from a success costs more than
         // it saves.
-        let entropy_threshold = if looks_benign(&content.raw) { 1000 } else { 500 };
+        let entropy_threshold = if looks_benign(&content.raw) {
+            preset.compression.benign_entropy_threshold.unwrap_or(1000)
+        } else {
+            preset.compression.entropy_threshold.unwrap_or(500)
+        };
         let record_list = content.raw.len() <= RECORD_LIST_MAX_CHARS
             && (stages_applied.iter().any(|s| s == "table_compact")
                 || looks_like_record_list(&content.raw));
-        if !lossless && !is_json && !is_code && !record_list && content.raw.len() > entropy_threshold {
+        if !lossless && !is_json && !is_code && !record_list && !diff_folded
+            && content.raw.len() > entropy_threshold
+        {
             if let Ok(trunc_result) = self.entropy_truncator.truncate_string(&content.raw) {
                 if trunc_result.segments_dropped > 0 {
                     content.raw = trunc_result.text;
@@ -317,7 +402,10 @@ impl CompressionPipeline {
         // Skipped on the lossless path so a JSON file read returns its bytes
         // verbatim — TOON re-encoding is data-lossless but reformats and
         // shifts line numbers, which breaks "read this file faithfully".
-        let data = if !lossless && ToonEncoder::is_json(&content.raw) {
+        // The parsed value survives for the cap below, which shrinks a JSON
+        // payload by dropping whole array items instead of slicing its text.
+        let mut json_value: Option<serde_json::Value> = None;
+        let mut data = if !lossless && ToonEncoder::is_json(&content.raw) {
             let json: serde_json::Value = serde_json::from_str(&content.raw)
                 .map_err(|e| SqzError::Other(format!("pipeline: JSON parse error: {e}")))?;
             let encoded = self.toon_encoder.encode(&json)?;
@@ -337,7 +425,7 @@ impl CompressionPipeline {
             } else {
                 None
             };
-            match with_dict {
+            let chosen = match with_dict {
                 Some(dict) if dict.len() < encoded.len() => {
                     stages_applied.push("dict_compress".to_owned());
                     stages_applied.push("toon_encode".to_owned());
@@ -347,10 +435,60 @@ impl CompressionPipeline {
                     stages_applied.push("toon_encode".to_owned());
                     encoded
                 }
-            }
+            };
+            json_value = Some(json);
+            chosen
         } else {
             content.raw
         };
+
+        if !lossless {
+            let max_tokens = preset
+                .compression
+                .max_output_tokens
+                .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
+            // A head/tail slice is only readable when the payload is text. Cut
+            // a JSON or TOON body and the result parses as neither, so those
+            // shrink by dropping whole array items and re-encoding instead.
+            if let Some(mut value) = json_value.take() {
+                let mut budget = crate::stages::DEFAULT_COLLAPSE_MAX_CHARS;
+                while self.count_tokens(&data, preset) > max_tokens && budget > 16 {
+                    budget /= 2;
+                    if !crate::stages::cap_json_arrays_to_chars(
+                        &mut value,
+                        ARRAY_CAP_MIN_ITEMS,
+                        budget,
+                        ARRAY_CAP_SUMMARY,
+                    ) {
+                        break;
+                    }
+                    data = self.toon_encoder.encode(&value)?;
+                    if !stages_applied.contains(&"array_cap".to_owned()) {
+                        stages_applied.push("array_cap".to_owned());
+                    }
+                }
+            } else if let Some(capped) = size_cap::cap_to_tokens(&data, max_tokens, |s| self.count_tokens(s, preset)) {
+                data = capped;
+                stages_applied.push("size_cap".to_owned());
+            }
+        }
+
+        // Template row grouping runs last, on the text that will actually ship.
+        // Rows that repeat one message with one distinct payload each (150
+        // compiler errors at 150 locations, one `ALTER TABLE` per table, one
+        // fetch line per package) collapse to the message once plus the values
+        // per row. The block is invertible (`expand_declared_templates`), so
+        // every path, number, and message string is still in the output.
+        //
+        // Running it after `size_cap` matters: a cap that cuts head and tail
+        // would otherwise slice through a block and leave a row count that no
+        // longer matches the rows beneath it.
+        if !lossless && !is_json && !is_code && !diff_folded && data.len() > 400 {
+            if let Some(fold) = crate::template_collapse::collapse_template_runs(&data, 6, 0.3) {
+                data = fold.text;
+                stages_applied.push("template_collapse".to_owned());
+            }
+        }
 
         Ok(CompressedContent {
             data,
@@ -734,6 +872,10 @@ mod tests {
                     summary_template: "... and {remaining} more items".into(),
                 }),
                 custom_transforms: Some(CustomTransformsConfig { enabled: true }),
+                json_projection: None,
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
@@ -764,6 +906,109 @@ mod tests {
         SessionContext {
             session_id: "test-session".into(),
         }
+    }
+
+    /// Folding must survive the verifier: an agent reading a folded diff still
+    /// needs every path, every hunk header, and the numbers in the body.
+    #[test]
+    fn folded_diff_passes_the_verifier() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n"
+            ));
+        }
+        let out = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(out.stages_applied.iter().any(|s| s == "diff_fold"), "{:?}", out.stages_applied);
+        let verify = crate::verifier::Verifier::verify(&input, &out.data);
+        assert!(
+            verify.passed,
+            "verifier rejected the folded diff: {:?}\n--- output ---\n{}",
+            verify.checks_failed, out.data
+        );
+    }
+
+    /// Long runs of one message with a distinct payload per row (one fetch per
+    /// package, one compiler error per location) must collapse to the message
+    /// once plus the values, and the verifier must still accept the result.
+    #[test]
+    fn template_collapse_fires_and_passes_the_verifier() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "src/features/module_{i}/Widget{i}.tsx({i},13): error TS2322: Type 'string' is not assignable to type 'number'.\n"
+            ));
+        }
+        let out = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(
+            out.stages_applied.iter().any(|s| s == "template_collapse"),
+            "template_collapse did not run; stages: {:?}",
+            out.stages_applied
+        );
+        assert_eq!(
+            out.data.matches("error TS2322").count(),
+            1,
+            "the shared message should appear once, not per row: {}",
+            out.data
+        );
+        let verify = crate::verifier::Verifier::verify(&input, &out.data);
+        assert!(
+            verify.passed,
+            "verifier rejected the template fold: {:?}\n--- output ---\n{}",
+            verify.checks_failed,
+            out.data
+        );
+    }
+
+    /// A diff in which every file carries the same body must fold on the
+    /// normal path, and every file path must survive.
+    #[test]
+    fn diff_fold_stage_fires_on_repeated_bodies() {
+        let pipeline = CompressionPipeline::new(&default_preset());
+        let mut input = String::new();
+        for i in 0..8 {
+            input.push_str(&format!(
+                "diff --git a/src/m{i}.rs b/src/m{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/m{i}.rs\n\
+                 +++ b/src/m{i}.rs\n\
+                 @@ -{i}0,8 +{i}0,10 @@ impl M{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n\
+                 -    let x_3 = compute(3);\n\
+                 +    let mut x_3 = compute(3).unwrap_or(3);\n"
+            ));
+        }
+        let result = pipeline.compress(&input, &ctx(), &default_preset()).unwrap();
+        assert!(
+            result.stages_applied.iter().any(|s| s == "diff_fold"),
+            "diff_fold did not run; stages: {:?}",
+            result.stages_applied
+        );
+        for i in 0..8 {
+            assert!(
+                result.data.contains(&format!("src/m{i}.rs")),
+                "path m{i} lost: {}",
+                result.data
+            );
+        }
+        assert!(result.data.len() < input.len());
     }
 
     /// Regression for https://github.com/ojuschugh1/sqz/issues/32 — the
@@ -911,6 +1156,43 @@ fn main() {
             let expected = if n < 3 { input.clone() } else { format!("{head}{line} [×{n}]\n{tail}") };
             assert_eq!(result.data, expected, "n={n}");
         }
+    }
+
+    #[test]
+    fn json_over_the_token_cap_shrinks_arrays_instead_of_slicing() {
+        let mut preset = default_preset();
+        preset.compression.max_output_tokens = Some(400);
+        let pipeline = CompressionPipeline::new(&preset);
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "samples": vec![0; 20_000],
+        }))
+        .unwrap();
+        let result = pipeline.compress(&pretty, &ctx(), &preset).unwrap();
+        assert!(
+            !result.data.contains("chars omitted"),
+            "a machine-readable payload is never sliced: {}",
+            &result.data[..result.data.len().min(200)]
+        );
+        assert!(
+            result.stages_applied.contains(&"array_cap".to_owned()),
+            "the cap shrinks arrays: {:?}",
+            result.stages_applied
+        );
+        let decoded = ToonEncoder.decode(&result.data).expect("TOON output still decodes");
+        let arr = decoded["samples"].as_array().unwrap();
+        let (summary, kept) = arr.split_last().unwrap();
+        let remaining: usize = summary
+            .as_str()
+            .and_then(|s| s.strip_prefix("... and "))
+            .and_then(|s| s.strip_suffix(" more items"))
+            .and_then(|n| n.parse().ok())
+            .expect("summary names how many were dropped");
+        assert_eq!(kept.len() + remaining, 20_000, "no sample is lost uncounted");
+        assert!(
+            kept.len() < 1_000,
+            "the array is cut to fit the cap, kept {}",
+            kept.len()
+        );
     }
 
     #[test]

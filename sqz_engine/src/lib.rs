@@ -52,6 +52,7 @@
 //! - [`CompressedContent`] — compression result with token counts and metadata
 
 pub mod adaptive_tree;
+pub mod size_cap;
 pub mod advanced_search;
 pub mod ansi_strip;
 pub mod api_proxy;
@@ -84,10 +85,12 @@ pub mod litm_positioner;
 pub mod mdl_selector;
 pub mod minhash_lsh;
 pub mod ngram_abbreviator;
+pub mod noise_run;
 pub mod opencode_plugin;
 pub mod rle_compressor;
 pub mod simhash;
 pub mod table_compactor;
+pub mod template_collapse;
 pub mod textrank;
 pub mod token_pruner;
 pub mod tool_hooks;
@@ -147,7 +150,7 @@ pub use image_compressor::{ImageCompressor, ImageDescription};
 pub use json_projection::{project_json, ProjectionConfig, ProjectionResult};
 pub use litm_positioner::{ContextSection, LitmPositioner, LitmStrategy, SectionType};
 pub use ngram_abbreviator::{NgramAbbreviator, AbbreviatorConfig, AbbreviationResult};
-pub use rle_compressor::{rle_compress, sliding_window_dedup, RleResult, SlidingWindowResult};
+pub use rle_compressor::{collapse_identical_diff_files, rle_compress, sliding_window_dedup, DiffFoldResult, RleResult, SlidingWindowResult};
 pub use simhash::{simhash, SimHashFingerprint};
 pub use structural_summary::{summarize as structural_summarize, summarize_multi, SummaryConfig, StructuralSummaryResult};
 pub use textrank::{textrank_compress, TextRankConfig, TextRankResult};
@@ -226,10 +229,10 @@ pub use terse_mode::TerseMode;
 pub use token_counter::TokenCounter;
 pub use types::*;
 pub use preset::{
-    BudgetConfig, CollapseArraysConfig, CompressionConfig, CondenseConfig, CustomTransformsConfig,
-    FlattenConfig, GitDiffFoldConfig, KeepFieldsConfig, ModelConfig, ModelPricingConfig, Preset,
-    PresetHeader, PresetMeta, PresetParser, StripFieldsConfig, StripNullsConfig, TerseLevel,
-    TerseModeConfig, ToolSelectionConfig, TruncateStringsConfig,
+    default_preset_toml, BudgetConfig, CollapseArraysConfig, CompressionConfig, CondenseConfig,
+    CustomTransformsConfig, FlattenConfig, GitDiffFoldConfig, KeepFieldsConfig, ModelConfig,
+    ModelPricingConfig, Preset, PresetHeader, PresetMeta, PresetParser, StripFieldsConfig,
+    StripNullsConfig, TerseLevel, TerseModeConfig, ToolSelectionConfig, TruncateStringsConfig,
 };
 pub use progressive_throttle::{ProgressiveThrottler, ThrottleConfig, ThrottleLevel};
 pub use dashboard::{

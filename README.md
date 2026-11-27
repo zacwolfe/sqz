@@ -610,23 +610,119 @@ Measured quality, including what each stage drops and what it never touches: [qu
 
 ## Configuration
 
-```toml
-# ~/.sqz/presets/default.toml
-[preset]
-name = "default"
-version = "1.0"
+sqz ships tuned: the defaults are the values the [token-saving audit](docs/260920-token-saving-audit.md) measured, and what limits savings in practice is coverage rather than a knob. Work through the sections below in order. Every command and table here was run against 2.2.0.
 
-[compression.condense]
-enabled = true
-max_repeated_lines = 3
+### Repair the wiring first
 
-[compression.strip_nulls]
-enabled = true
+An install that saves less than expected is usually half-configured, and `sqz doctor` names each case with the token cost attached:
 
-[budget]
-warning_threshold = 0.70
-default_window_size = 200000
+| what `sqz doctor` reports | what it costs |
+|---|---|
+| the same hook installed at user scope and again in a project file | every piped command starts sqz twice |
+| guidance in `AGENTS.md`, `CLAUDE.md` or a client rules file written by an older sqz | stale instructions read on every request |
+| guidance installed for clients you do not use | one copy per client, paid on every request in that client |
+| a hook from an older install, without the `Bash(set -o pipefail)` and `Bash(sqz compress --cmd *)` allow rules | commands that should be piped are skipped, so their output arrives whole |
+| an MCP server registered but never called | its tool definitions, roughly 1.4k tokens, on every request |
+| hook files left behind by clients current sqz no longer writes | stale wiring that hides the real findings |
+| cached output from 2.1.1 or earlier that contains a credential line | sensitive bytes kept in the cache |
+
+`sqz doctor` changes nothing, and `sqz doctor --fix` repairs what it finds and prints each change.
+
+To end up with only the clients you use, run `sqz uninstall` (it removes every hook and client config sqz installed) and then `sqz init --only claude,codex`. A client sqz never configured costs nothing.
+
+### Coverage decides the total
+
+Measured over 230 Claude Code transcripts, 24,364 tool results and 8.3M context tokens:
+
+| source | share of tokens | does sqz see it? |
+|---|---:|---|
+| `Bash` | 54.3% | yes, through the hook |
+| built-in `Read` | 28.5% | only when the agent calls `sqz_read_file` |
+| other MCP servers | 16.3% | only when proxied through `sqz proxy` or piped by hand |
+| sqz's own MCP tools | 0.8% | already compressed |
+
+The second row is the largest remaining win, and it is behaviour rather than a setting. Those reads touched 692 files across 1,784 calls, so 61% were repeats, and a repeat served as a `§ref:HASH§` costs about 13 tokens. `sqz_read_file`, `sqz_grep` and `sqz_list_dir` exist for this, and the guidance sqz installs tells agents to reach for them on anything over about 2KB or anything they might read twice. They work where sqz-mcp is registered and where the agent chooses them; in clients sqz can only advise, the agent has to pipe through `sqz compress` itself.
+
+### Pick the mode per invocation
+
+Auto routing decides per input: credential lines, stack traces and SQL DDL pass through untouched, content under 100 bytes stays in the default mode, blocks averaging under 2.5 bits of entropy per byte route to aggressive, and everything else runs default. On top of that, auto is not a fixed setting. The hook path counts the tokens sqz has compressed in the last 30 minutes from `~/.sqz/sessions.db`, and once that passes 80,000 it escalates the rest of the window to aggressive. Both columns are measured below, with a scratch `SQZ_DB_PATH` for the first and a database pushed past 80,000 for the second:
+
+| fixture | input bytes | auto, under 80k in 30 min | auto, over 80k | `--mode aggressive` |
+|---|---:|---:|---:|---:|
+| api.json | 26,533 | 10,979 | 7,267 | 7,224 |
+| server.log | 99,573 | 11,922 | 5,950 | 5,906 |
+| ls.txt | 8,830 | 951 | 812 | 768 |
+| tsc.txt | 14,690 | 5,172 | 4,945 | 4,901 |
+| six machine-output fixtures (cargo_test, gitdiff, npm, pytest, docker ps, migration.sql) | 72,120 | 25,965 | 25,965 | 25,833 |
+
+```sh
+# no pressure: auto runs the default pass, 10979 bytes for api.json
+SQZ_DB_PATH=/tmp/sqz-clean.db SQZ_NO_DEDUP=1 sqz compress --no-cache < api.json | wc -c
+
+# past 80,000 compressed tokens in 30 minutes, auto escalates: 7267 bytes
+for i in $(seq 16); do
+  SQZ_DB_PATH=/tmp/sqz-hot.db sqz compress --no-cache < server.log > /dev/null
+done
+SQZ_DB_PATH=/tmp/sqz-hot.db SQZ_NO_DEDUP=1 sqz compress --no-cache < api.json | wc -c
 ```
+
+The over-80k column is a few dozen bytes above the explicit aggressive column because the hook path also appends the `[full output: sqz expand <prefix>]` line. Aggressive works by cutting more: the output cap drops from 8,000 to 4,000 tokens and truncation, repeated-line condensing and array collapsing all tighten, which is why it matters on a JSON payload whose array items each survive the default pass (api.json 10,979 to 7,224 bytes) and barely moves output the default pass already reduced (the six machine-output fixtures 25,965 to 25,833). Use it for API dumps and repeated rows you will not parse, and keep the default when you will diff or parse the result.
+
+Two consequences worth knowing. First, the escalation means a long session compresses harder than a fresh one, so benchmark numbers only compare when the database state matches; `--mode default` pins the weaker mode and `--mode aggressive` pins the stronger one, both bypassing the pressure check. Second, `~/.sqz/presets` does not enter into it: the CLI and the hook use the preset compiled into the binary.
+
+A hands-off install never passes `--mode`: the rewritten command is `sqz compress --cmd '<command>'` and nothing else, so hook traffic is always auto. To pin a mode for one task, write the pipe yourself. Both hooks then stand down, `sqz hook claude` echoing the command unchanged and `sqz hook claude-post` returning no replacement for its result, because both skip a command containing `sqz compress`. Measured with the release binary and `tsc.txt`: the wrapped command's result came back as written (0-byte hook reply), while the same result from an unwrapped command was replaced with a 5,459-byte version.
+
+```sh
+cat api.json | sqz compress --mode aggressive
+```
+
+Force it when you want the shape of a payload and none of the individual values, which is the case the default pass preserves. On api.json the default pass returns all 120 `ord_` records in 10,979 bytes, aggressive returns 56 of them followed by a literal `"... and 64 more items"` in 7,224 bytes. Use it for API dumps, repeated rows and log floods you will only skim, and keep the default for anything you will count, diff, parse or copy values out of, since the rows it drops are not in the store to expand.
+
+Reading back which mode ran is harder than it should be, because the two paths log differently: an explicit `--mode aggressive` writes `aggressive` into `compression_log.mode`, while the auto path writes the command label there (`stdin` for a bare pipe). The dependable signals are the stderr lines, `[sqz] mode: aggressive (maximum reduction)` for the flag and `[sqz] adaptive: high session pressure (...) tokens/30min, escalating compression` for an escalation, and the `[full output: sqz expand <prefix>]` trailer, which the auto path adds and aggressive does not. The pressure count itself is global: it sums every project that shares `~/.sqz/sessions.db`, so one busy project escalates the rest of them until the window expires. Give a project its own `SQZ_DB_PATH` when its compression behaviour has to stay independent of the others.
+
+One JSON-specific lever: nested objects keep their values by default, and `SQZ_JSON_SUMMARIZE_DEEP=1` replaces them with `{"...": "N keys"}` once they pass `SQZ_JSON_MAX_DEPTH` (default 12). On api.json, depth 2 takes it to 1,750 bytes and deletes every nested value.
+
+### Leave the output cap alone
+
+A single result over 8,000 tokens is reduced to fit: text is cut to its head and tail with a marker naming what went missing, and JSON drops whole array elements plus a declared count instead of slicing into text that parses as neither format. The cap is where the largest single win comes from, since the biggest result in one local database was 1,199,001 tokens and shipped at 7,982. Raising it gives back most of what sqz was installed for. `--lossless` (or `SQZ_LOSSLESS=1`) turns the lossy path off entirely and keeps only ANSI stripping. `SQZ_NO_DEDUP=1` or `--no-cache` turns references off for one invocation, which is how the table above was measured.
+
+### Reference lifetime
+
+A `§ref:HASH§` is served only while the original is still in context: 30 minutes from issue, reset on compaction. That is shorter than a long agent session, so raise it when sessions run long, and pin what gets re-injected every time:
+
+```sh
+export SQZ_REF_TTL_SECS=86400   # a day; 0 turns references off entirely
+sqz pin add CLAUDE.md           # bypasses the TTL for this content, forever
+```
+
+### Environment variables
+
+All optional, and the value listed is the default:
+
+| variable | default | effect |
+|---|---|---|
+| `SQZ_REF_TTL_SECS` | `1800` | seconds a `§ref:HASH§` stays redeemable; `0` disables references |
+| `SQZ_DB_PATH` | `~/.sqz/sessions.db` | where stats, the dedup cache and sessions live |
+| `SQZ_LOSSLESS` | unset | `1` disables every lossy stage, keeping ANSI stripping and references |
+| `SQZ_NO_DEDUP` | unset | `1` never emits references |
+| `SQZ_NO_ABBREV` | unset | `1` keeps repeated phrases, paths and SHAs verbatim; better set for one command than globally |
+| `SQZ_JSON_SUMMARIZE_DEEP` | unset | `1` re-enables the lossy deep-object summarization |
+| `SQZ_JSON_MAX_DEPTH` | `12` | depth at which that summarization starts |
+| `SQZ_QUIET` | unset | `1` silences the stderr summary lines, which are already suppressed when stderr is not a terminal |
+| `SQZ_VERBOSE` | unset | `1` prints one line when safe mode passes content through unchanged |
+| `SQZ_HOOK_DEBUG` | unset | `1` prints one line per hook decision, for a hook that does not seem to fire |
+| `SQZ_REGRET_WINDOW_SECS` | `120` | how long after a compression a re-run of the same command counts as regret |
+| `SQZ_CMD` | unset | labels a compression in stats; the hook passes `--cmd`, which is the same thing |
+
+### Preset files
+
+The CLI and the shell hook compress with the preset compiled into the binary, so editing `~/.sqz/presets/default.toml` does not change hook behaviour. That file is read by `sqz-mcp --preset-dir <dir>`, which validates every `.toml` in the directory on load and hot-reloads it when it changes. `sqz init` writes the full default preset there, generated from the compiled default so it always parses; point the MCP server at the directory to tune that path from a file:
+
+```json
+{ "mcpServers": { "sqz": { "command": "sqz-mcp", "args": ["--transport", "stdio", "--preset-dir", "$HOME/.sqz/presets"] } } }
+```
+
+A preset is the whole schema, not a patch: the sections in the generated file (`[preset]`, `[compression]`, `[tool_selection]`, `[budget]`, `[terse_mode]`, `[model]`) are all required, and unrecognised keys are ignored. Copy the file before editing, and remember that a stage disabled there is disabled for every MCP call.
 
 ### Per-project database
 
@@ -639,10 +735,12 @@ per-project instead:
 export SQZ_DB_PATH="$PWD/.sqz/sessions.db"
 ```
 
-Every surface honors it — the shell hook, `sqz stats`/`gain`/`expand`, and
+Every surface honors it: the shell hook, `sqz stats`/`gain`/`expand`, and
 the MCP server (set it under `env` in your MCP config). Prefer absolute
 paths: relative values resolve against whatever directory the process runs
-from. The parent directory is created if missing (mode 0700, like `~/.sqz`).
+from. A missing parent directory is created at mode 0700, matching `~/.sqz`,
+and a directory that already exists is left with its own permissions. An
+empty value counts as unset, so `SQZ_DB_PATH=` falls back to the default.
 
 ## Privacy
 

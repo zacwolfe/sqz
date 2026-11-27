@@ -34,6 +34,40 @@ pub struct SessionSummary {
 ///     println!("{}: {}", session.id, session.compressed_summary);
 /// }
 /// ```
+///
+/// ## Purging fixture rows from an older local database
+///
+/// Before tests were isolated, running the suite could append synthetic
+/// rows to a developer's real `~/.sqz/sessions.db`. Property tests replayed
+/// fixture commands (`cargo test`, `curl`, `ls`, `npm install`, `pytest`,
+/// `docker build`, `git diff`, `tail`) once per generated case, leaving a
+/// `regret_log` with a small, fixed number of rows per command. Those rows
+/// describe no real usage and can distort `sqz stats` and
+/// `sqz discover`.
+///
+/// Back up the database first, preview the rows for the date of the polluted
+/// test run, then delete that same selection. Run these only against a
+/// database you have backed up, and not while an agent session is writing to
+/// it:
+///
+/// ```sh
+/// cp ~/.sqz/sessions.db ~/.sqz/sessions.db.bak
+/// # Preview first; replace YYYY-MM-DD with the polluted day.
+/// sqlite3 ~/.sqz/sessions.db \
+///   "SELECT id, kind, cmd, created_at FROM regret_log
+///      WHERE cmd IN ('cargo test','curl','ls','npm install',
+///                    'pytest','docker build','git diff','tail')
+///        AND date(created_at) = 'YYYY-MM-DD';"
+/// sqlite3 ~/.sqz/sessions.db \
+///   "DELETE FROM regret_log
+///      WHERE cmd IN ('cargo test','curl','ls','npm install',
+///                    'pytest','docker build','git diff','tail')
+///        AND date(created_at) = 'YYYY-MM-DD';"
+/// sqlite3 ~/.sqz/sessions.db "VACUUM;"
+/// ```
+///
+/// Scope the `WHERE` to the polluted date. Deleting by command alone can
+/// remove genuine rows from real `curl` or `git diff` usage.
 pub struct SessionStore {
     db: Connection,
 }
@@ -107,7 +141,11 @@ CREATE TABLE IF NOT EXISTS compression_log (
     tokens_compressed INTEGER NOT NULL,
     stages_applied   TEXT NOT NULL,
     mode             TEXT NOT NULL DEFAULT 'auto',
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    -- Full, uncapped caller label. `mode` is capped for display and
+    -- grouping; this preserves the original command for debugging.
+    -- NULL on rows written before this column existed.
+    cmd_full         TEXT
 );
 
 -- Compression-regret signals. A 'rerun' row means the agent re-produced
@@ -188,6 +226,18 @@ pub(crate) fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute("ALTER TABLE compression_log ADD COLUMN project_dir TEXT", [])?;
     }
 
+    // Additive migration: add `cmd_full` TEXT column to compression_log.
+    // `mode` is capped so an overlong caller label cannot bloat per-command
+    // stats; `cmd_full` keeps the original command. NULL for rows written
+    // by older sqz versions.
+    let has_cmd_full: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('compression_log') WHERE name = 'cmd_full'")?
+        .query_row([], |_| Ok(()))
+        .is_ok();
+    if !has_cmd_full {
+        conn.execute("ALTER TABLE compression_log ADD COLUMN cmd_full TEXT", [])?;
+    }
+
     // Additive migration: add `pinned` flag to cache_entries. Pinned
     // entries bypass the TTL freshness check so stable wiki / knowledge
     // base content stays dedup-able forever.
@@ -203,6 +253,40 @@ pub(crate) fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+/// Maximum display width (in chars) stored in `compression_log.mode`.
+pub const MAX_MODE_LABEL_CHARS: usize = 120;
+
+/// A label used for callers whose "command" carries no information: the
+/// bare `true`/`false`/`:` shell no-ops and empty strings. Shell hooks can
+/// pass those through verbatim (`SQZ_CMD` / `--cmd`), which pollutes
+/// per-command stats and turns rerun-regret into noise.
+pub const NOOP_LABEL: &str = "noop";
+
+/// Map an informational-noise label to [`NOOP_LABEL`]. Every real label is
+/// returned unchanged so compression behaviour and existing stats keys stay
+/// byte-identical.
+pub fn normalize_mode_label(label: &str) -> &str {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || matches!(trimmed, "true" | "false" | ":") {
+        NOOP_LABEL
+    } else {
+        label
+    }
+}
+
+/// Cap a caller-supplied label for the `mode` column. Short labels are
+/// returned byte-identical. Longer labels are whitespace-collapsed and
+/// truncated on a char boundary to [`MAX_MODE_LABEL_CHARS`], ending in `…`.
+fn cap_mode_label(label: &str) -> String {
+    if label.chars().count() <= MAX_MODE_LABEL_CHARS {
+        return label.to_string();
+    }
+    let collapsed = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut capped: String = collapsed.chars().take(MAX_MODE_LABEL_CHARS - 1).collect();
+    capped.push('…');
+    capped
 }
 
 fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
@@ -642,11 +726,36 @@ impl SessionStore {
     }
 
     /// Return all cache entries ordered by `accessed_at` ASC (oldest first),
-    /// as `(hash, size_bytes)` pairs where `size_bytes` is the byte length of
-    /// the stored JSON data.
+    /// as `(hash, size_bytes)` pairs where `size_bytes` is the total stored
+    /// size of the row: the byte length of the stored JSON `data` plus the
+    /// byte length of the raw `original` blob when present. Both columns are
+    /// real on-disk payload, so reporting only `length(data)` understated a
+    /// typical cache by roughly half.
     pub fn list_cache_entries_lru(&self) -> Result<Vec<(String, u64)>> {
         let mut stmt = self.db.prepare(
-            "SELECT hash, length(data) FROM cache_entries ORDER BY accessed_at ASC",
+            "SELECT hash, length(data) + COALESCE(length(original), 0) \
+             FROM cache_entries ORDER BY accessed_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (hash, size) = row?;
+            entries.push((hash, size as u64));
+        }
+        Ok(entries)
+    }
+
+    /// Return the same `(hash, size_bytes)` pairs as
+    /// [`list_cache_entries_lru`](Self::list_cache_entries_lru), but only for
+    /// entries that are eligible for eviction (i.e. not pinned), oldest
+    /// accessed first. Pinned entries are exempt from the cache budget and
+    /// must never be deleted by LRU eviction.
+    pub fn list_evictable_cache_entries_lru(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT hash, length(data) + COALESCE(length(original), 0) \
+             FROM cache_entries WHERE pinned = 0 ORDER BY accessed_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -875,14 +984,17 @@ impl SessionStore {
     }
 
     /// List every pinned cache entry. Returns `(hash, accessed_at, size_bytes)`
-    /// tuples so the CLI can render a useful table.
+    /// tuples so the CLI can render a useful table. `size_bytes` covers both
+    /// stored columns (`data` plus `original`) so it matches the cache-size
+    /// accounting used by `sqz stats`.
     pub fn list_pinned_cache_entries(
         &self,
     ) -> Result<Vec<(String, DateTime<Utc>, u64)>> {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT hash, accessed_at, length(data) FROM cache_entries \
+                "SELECT hash, accessed_at, \
+                 length(data) + COALESCE(length(original), 0) FROM cache_entries \
                  WHERE pinned = 1 ORDER BY accessed_at DESC",
             )
             .map_err(SqzError::SessionStore)?;
@@ -953,9 +1065,14 @@ impl SessionStore {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let stages_str = stages.join(",");
+        // Keep the full original label for debugging, but normalize the
+        // noise labels and cap the display/grouping column.
+        let cmd_full = mode;
+        let mode = normalize_mode_label(mode);
+        let mode = cap_mode_label(mode);
         self.db.execute(
-            "INSERT INTO compression_log (tokens_original, tokens_compressed, stages_applied, mode, created_at, project_dir) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![tokens_original, tokens_compressed, stages_str, mode, now, project_dir],
+            "INSERT INTO compression_log (tokens_original, tokens_compressed, stages_applied, mode, created_at, project_dir, cmd_full) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![tokens_original, tokens_compressed, stages_str, mode, now, project_dir, cmd_full],
         ).map_err(SqzError::SessionStore)?;
         Ok(())
     }
@@ -971,6 +1088,34 @@ impl SessionStore {
             params![kind, cmd, hash, gap_secs, now],
         ).map_err(SqzError::SessionStore)?;
         Ok(())
+    }
+
+    /// Like [`log_regret`](Self::log_regret), but skips the insert when an
+    /// identical `(kind, cmd, hash)` row was already written within
+    /// `dedupe_secs`. Repeated reruns of the same content in a tight loop
+    /// describe one regret, not N.
+    pub fn log_regret_deduped(
+        &self,
+        kind: &str,
+        cmd: &str,
+        hash: &str,
+        gap_secs: f64,
+        dedupe_secs: f64,
+    ) -> Result<()> {
+        let cutoff = (Utc::now()
+            - chrono::Duration::milliseconds((dedupe_secs * 1000.0) as i64))
+        .to_rfc3339();
+        let exists = self
+            .db
+            .prepare(
+                "SELECT 1 FROM regret_log WHERE kind = ?1 AND cmd = ?2 AND hash = ?3 AND created_at >= ?4 LIMIT 1",
+            )?
+            .query_row(params![kind, cmd, hash, cutoff], |_| Ok(()))
+            .is_ok();
+        if exists {
+            return Ok(());
+        }
+        self.log_regret(kind, cmd, hash, gap_secs)
     }
 
     /// Aggregate regret counts for `sqz stats`.
@@ -1266,10 +1411,15 @@ impl SessionStore {
     /// compaction or start). Used by the adaptive pressure system to
     /// decide whether to escalate compression intensity.
     pub fn session_pressure(&self, since_minutes: u32) -> Result<u64> {
+        // `julianday` on both sides, not a string comparison: `created_at` is
+        // RFC 3339 ("2026-11-16T02:55:25.378324+00:00") and `datetime('now')`
+        // returns "2026-11-16 02:25:54". The `T` sorts above the space, so a
+        // string compare counted every row from the same calendar day and the
+        // window silently became "since midnight UTC".
         let mut stmt = self.db.prepare(
             "SELECT COALESCE(SUM(tokens_compressed), 0) \
              FROM compression_log \
-             WHERE created_at >= datetime('now', ?1)",
+             WHERE julianday(created_at) >= julianday('now', ?1)",
         ).map_err(SqzError::SessionStore)?;
 
         let offset = format!("-{since_minutes} minutes");
@@ -1539,6 +1689,81 @@ impl SessionStore {
             .collect())
     }
 
+    /// Per-stage breakdown from `compression_log.stages_applied`.
+    ///
+    /// `stages_applied` is a comma-joined list, and a row is credited in
+    /// full to every stage it ran. The per-stage token totals therefore
+    /// overlap by construction: they describe which stages do the work,
+    /// and MUST NOT be summed into a grand total. Rows with no recorded
+    /// stage are skipped.
+    ///
+    /// Returns `(stage, tokens_in, tokens_out, rows)` sorted by row count.
+    pub fn stage_breakdown(&self) -> Result<Vec<(String, u64, u64, u32)>> {
+        self.stage_breakdown_inner(None)
+    }
+
+    /// [`stage_breakdown`](Self::stage_breakdown) filtered to one project.
+    pub fn stage_breakdown_for_project(
+        &self,
+        project_dir: &str,
+    ) -> Result<Vec<(String, u64, u64, u32)>> {
+        self.stage_breakdown_inner(Some(project_dir))
+    }
+
+    fn stage_breakdown_inner(
+        &self,
+        project_dir: Option<&str>,
+    ) -> Result<Vec<(String, u64, u64, u32)>> {
+        // Group in SQLite first so only distinct stage strings cross into
+        // Rust; splitting those in memory is cheaper than recursing in SQL.
+        let sql = if project_dir.is_some() {
+            "SELECT stages_applied, SUM(tokens_original), SUM(tokens_compressed), COUNT(*) \
+             FROM compression_log WHERE project_dir = ?1 \
+             GROUP BY stages_applied ORDER BY COUNT(*) DESC LIMIT 50"
+        } else {
+            "SELECT stages_applied, SUM(tokens_original), SUM(tokens_compressed), COUNT(*) \
+             FROM compression_log GROUP BY stages_applied ORDER BY COUNT(*) DESC LIMIT 50"
+        };
+        let mut stmt = self.db.prepare(sql).map_err(SqzError::SessionStore)?;
+
+        let mut stages: std::collections::HashMap<String, (u64, u64, u32)> =
+            std::collections::HashMap::new();
+        let collect = |row: &rusqlite::Row<'_>| {
+            let stages_str: String = row.get(0)?;
+            let tokens_in: u64 = row.get(1)?;
+            let tokens_out: u64 = row.get(2)?;
+            let count: u32 = row.get(3)?;
+            Ok((stages_str, tokens_in, tokens_out, count))
+        };
+
+        if let Some(dir) = project_dir {
+            let rows = stmt
+                .query_map(params![dir], |row| collect(row))
+                .map_err(SqzError::SessionStore)?;
+            for row in rows {
+                let (stages_str, tokens_in, tokens_out, count) =
+                    row.map_err(SqzError::SessionStore)?;
+                add_stage_row(&mut stages, &stages_str, tokens_in, tokens_out, count);
+            }
+        } else {
+            let rows = stmt
+                .query_map([], |row| collect(row))
+                .map_err(SqzError::SessionStore)?;
+            for row in rows {
+                let (stages_str, tokens_in, tokens_out, count) =
+                    row.map_err(SqzError::SessionStore)?;
+                add_stage_row(&mut stages, &stages_str, tokens_in, tokens_out, count);
+            }
+        }
+
+        let mut result: Vec<_> = stages
+            .into_iter()
+            .map(|(name, (tin, tout, cnt))| (name, tin, tout, cnt))
+            .collect();
+        result.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        Ok(result)
+    }
+
     /// Per-command breakdown: group compression_log by mode.
     pub fn per_command_breakdown(&self) -> Result<Vec<(String, u64, u64, u32)>> {
         let mut stmt = self
@@ -1623,6 +1848,28 @@ pub struct SliceCandidate {
     pub hash: String,
     pub original: Vec<u8>,
     pub data_json: String,
+}
+
+/// Add one `stages_applied` group to a stage breakdown map. A row is
+/// credited in full to every stage it ran, matching the comma-joined
+/// storage format.
+fn add_stage_row(
+    stages: &mut std::collections::HashMap<String, (u64, u64, u32)>,
+    stages_str: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    count: u32,
+) {
+    for stage in stages_str.split(',') {
+        let stage = stage.trim();
+        if stage.is_empty() {
+            continue;
+        }
+        let entry = stages.entry(stage.to_string()).or_default();
+        entry.0 += tokens_in;
+        entry.1 += tokens_out;
+        entry.2 += count;
+    }
 }
 
 /// One `sqz recall` search hit.
@@ -1723,6 +1970,114 @@ mod tests {
             provenance: crate::types::Provenance::default(),
             verify: None,
         }
+    }
+
+    #[test]
+    fn long_labels_are_capped_but_cmd_full_is_retained() {
+        let store = in_memory_store();
+        let long = format!("git log --oneline {}", "x".repeat(300));
+        store.log_compression(100, 40, &[], &long).unwrap();
+        let (mode, full): (String, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT mode, cmd_full FROM compression_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode.chars().count(), MAX_MODE_LABEL_CHARS);
+        assert!(mode.ends_with('…'), "capped label must end in an ellipsis: {mode}");
+        assert_eq!(full.as_deref(), Some(long.as_str()), "cmd_full must keep the original");
+    }
+
+    #[test]
+    fn short_labels_stay_byte_identical_and_noise_labels_normalize() {
+        let store = in_memory_store();
+        store.log_compression(100, 40, &[], "cargo test").unwrap();
+        store.log_compression(100, 40, &[], " true ").unwrap();
+        store.log_compression(100, 40, &[], "dedup").unwrap();
+        let modes: Vec<String> = store
+            .db
+            .prepare("SELECT mode FROM compression_log ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(modes, vec!["cargo test", "noop", "dedup"]);
+    }
+
+    #[test]
+    fn deduped_regret_logs_one_row_per_window() {
+        let store = in_memory_store();
+        store.log_regret_deduped("rerun", "git log", "abc", 5.0, 120.0).unwrap();
+        store.log_regret_deduped("rerun", "git log", "abc", 6.0, 120.0).unwrap();
+        // A different hash is a distinct regret.
+        store.log_regret_deduped("rerun", "git log", "def", 7.0, 120.0).unwrap();
+        assert_eq!(store.regret_stats().unwrap().reruns, 2);
+    }
+
+    #[test]
+    fn pressure_window_is_relative_not_calendar() {
+        let store = in_memory_store();
+        // 400 tokens just now, 600 tokens 40 minutes ago. Only the first is
+        // inside a 30-minute window; the string comparison this used to do
+        // counted both, because both carry today's date.
+        store.log_compression(1000, 400, &[], "auto").unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO compression_log \
+                 (tokens_original, tokens_compressed, stages_applied, mode, created_at) \
+                 VALUES (1000, 600, '', 'auto', strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-40 minutes'))",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(store.session_pressure(30).unwrap(), 400);
+        assert_eq!(store.session_pressure(60).unwrap(), 1000);
+    }
+
+    #[test]
+    fn stage_breakdown_credits_each_stage_a_row_ran() {
+        let store = in_memory_store();
+        store
+            .log_compression(
+                1000,
+                400,
+                &["condense".to_string(), "path_shorten".to_string()],
+                "git",
+            )
+            .unwrap();
+        store
+            .log_compression(500, 100, &["condense".to_string()], "cargo")
+            .unwrap();
+        store.log_compression(200, 200, &[], "auto").unwrap();
+        store
+            .log_compression(300, 30, &["dedup".to_string()], "dedup")
+            .unwrap();
+
+        let rows = store.stage_breakdown().unwrap();
+        let find = |name: &str| rows.iter().find(|(n, ..)| n == name).cloned();
+
+        assert_eq!(
+            find("condense").unwrap(),
+            ("condense".to_string(), 1500, 500, 2)
+        );
+        // Credited in full to every stage the row ran, not split between them.
+        assert_eq!(
+            find("path_shorten").unwrap(),
+            ("path_shorten".to_string(), 1000, 400, 1)
+        );
+        assert_eq!(
+            find("dedup").unwrap(),
+            ("dedup".to_string(), 300, 30, 1)
+        );
+        assert_eq!(rows.len(), 3, "rows without a recorded stage are skipped");
+
+        // The overlap is the point: summed stage totals exceed the real total.
+        let stage_in_sum: u64 = rows.iter().map(|r| r.1).sum();
+        assert!(stage_in_sum > store.compression_stats().unwrap().total_tokens_in);
     }
 
     #[test]
@@ -2047,6 +2402,44 @@ mod tests {
         assert_eq!(loaded.data, entry.data);
         assert_eq!(loaded.tokens_compressed, entry.tokens_compressed);
         assert_eq!(loaded.tokens_original, entry.tokens_original);
+    }
+
+    #[test]
+    fn cache_size_accounting_includes_original_bytes() {
+        let store = in_memory_store();
+        let entry = CompressedContent {
+            data: "compressed payload".to_string(),
+            tokens_compressed: 3,
+            tokens_original: 12,
+            stages_applied: vec![],
+            compression_ratio: 0.25,
+            provenance: crate::types::Provenance::default(),
+            verify: None,
+        };
+        // `save_cache_entry_with_original` stores the serialized struct in
+        // `data`, so the expected row size is that JSON plus the raw blob.
+        let data_bytes = serde_json::to_string(&entry).unwrap().len() as u64;
+        let original = b"raw uncompressed output bytes";
+
+        store
+            .save_cache_entry_with_original("hash-sized", &entry, Some(original))
+            .unwrap();
+        // A legacy-style row with no original still counts its `data` bytes.
+        store.save_cache_entry("hash-legacy", &entry).unwrap();
+
+        let entries = store.list_cache_entries_lru().unwrap();
+        let size_of = |hash: &str| {
+            entries
+                .iter()
+                .find(|(h, _)| h == hash)
+                .unwrap_or_else(|| panic!("missing {hash}"))
+                .1
+        };
+
+        assert_eq!(size_of("hash-sized"), data_bytes + original.len() as u64);
+        assert_eq!(size_of("hash-legacy"), data_bytes);
+        let total: u64 = entries.iter().map(|(_, size)| size).sum();
+        assert_eq!(total, data_bytes * 2 + original.len() as u64);
     }
 
     #[test]

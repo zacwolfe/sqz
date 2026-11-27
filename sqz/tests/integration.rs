@@ -37,6 +37,10 @@ fn sandboxed<'a>(cmd: &'a mut Command, home: &std::path::Path) -> &'a mut Comman
         .env("CODEX_HOME", home.join(".codex"))
         .env("COPILOT_HOME", home.join(".copilot"))
         .env("SQZ_DB_PATH", home.join("sessions.db"))
+        // Tests capture stderr in a pipe, which sqz treats as an agent
+        // context and silences banners in. Force them on so assertions about
+        // status output remain meaningful.
+        .env("SQZ_QUIET", "0")
 }
 
 fn run(args: &[&str]) -> Output {
@@ -77,6 +81,7 @@ fn run_with_db(db: &std::path::Path, args: &[&str], stdin: Option<&str>) -> Outp
         .env_remove("SQZ_NO_DEDUP")
         .env_remove("SQZ_NO_ABBREV")
         .env_remove("SQZ_LOSSLESS")
+        .env("SQZ_QUIET", "0")
         .current_dir(workspace_root())
         .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
         .stdout(std::process::Stdio::piped())
@@ -609,6 +614,7 @@ fn run_panicking(at: &str, backtrace: Option<&str>, db: &std::path::Path, args: 
     cmd.args(args)
         .env("SQZ_DB_PATH", db)
         .env("SQZ_TEST_PANIC", at)
+        .env("SQZ_QUIET", "0")
         .env_remove("RUST_BACKTRACE")
         .current_dir(workspace_root())
         .stdin(std::process::Stdio::piped())

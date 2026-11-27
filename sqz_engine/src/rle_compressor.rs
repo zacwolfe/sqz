@@ -237,6 +237,223 @@ fn is_volatile(token: &str) -> bool {
     false
 }
 
+// ── Indexed-row compaction ───────────────────────────────────────────────────
+
+/// Result of indexed-row compaction.
+#[derive(Debug, Clone)]
+pub struct IndexedRowResult {
+    pub text: String,
+    pub runs_collapsed: usize,
+    pub rows_collapsed: usize,
+    pub tokens_saved: u32,
+}
+
+/// Collapse consecutive rows that differ only in an index or name field.
+///
+/// [`log_template_collapse`] masks timestamps, durations, and percentages, so
+/// `test tests::case_0 ... ok` and `test tests::case_1 ... ok` never share a
+/// template and three hundred such rows survive verbatim. This stage handles
+/// that shape: rows with the same token count that differ in one token, or in
+/// two tokens that share a non-digit prefix and both end in digits (`t_7`
+/// alongside `col_7`, and still true for `t_12` alongside `col_12`).
+///
+/// Safety rules, all required:
+/// - First and last row of a run stay verbatim, so the reader sees where the
+///   run starts and where it ends.
+/// - The marker names how many rows went missing and which field varied, so
+///   the loss is declared rather than silent.
+/// - A line containing a signal word (error, panic, failed, assert, ...) is
+///   never collapsed and breaks the run, so a run cannot swallow a failure.
+/// - Diff payload never collapses: `diff --git`, `@@`, or `+++`/`---` anywhere
+///   in the buffer disables the stage, because in a diff the changed lines are
+///   the content.
+/// - A run needs at least three distinct values, so two rows flapping between
+///   two names do not become a "range".
+/// - Differing tokens carrying `/`, `=`, or `|` block the run: that is a path,
+///   an assignment, or a table cell, not an index.
+pub fn collapse_indexed_rows(text: &str, min_run_length: usize) -> Result<IndexedRowResult> {
+    let identity = || IndexedRowResult {
+        text: text.to_string(),
+        runs_collapsed: 0,
+        rows_collapsed: 0,
+        tokens_saved: 0,
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let min_run_length = min_run_length.max(3);
+    if lines.len() < min_run_length {
+        return Ok(identity());
+    }
+    if lines.iter().any(|line| {
+        line.starts_with("diff --git")
+            || line.starts_with("@@")
+            || line.starts_with("+++ ")
+            || line.starts_with("--- ")
+    }) {
+        return Ok(identity());
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut runs_collapsed = 0usize;
+    let mut rows_collapsed = 0usize;
+    let mut tokens_saved = 0u32;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let mut end = i + 1;
+        if !is_signal_row(lines[i]) {
+            while end < lines.len()
+                && !is_signal_row(lines[end])
+                && lines[end] != lines[i]
+                && compatible_rows(lines[i], lines[end])
+            {
+                end += 1;
+            }
+        }
+
+        let run_len = end - i;
+        let omitted = run_len.saturating_sub(2);
+        if run_len >= min_run_length
+            && omitted > 0
+            && distinct_varying_values(&lines[i..end]) >= 3
+        {
+            let (field, first_value, _) = row_difference(lines[i], lines[i + 1]);
+            let (_, _, last_value) = row_difference(lines[i], lines[end - 1]);
+            output.push(lines[i].to_string());
+            output.push(format!(
+                "[×{omitted} rows omitted: {field} spans \"{first_value}\" .. \"{last_value}\", all other fields identical]"
+            ));
+            output.push(lines[end - 1].to_string());
+            runs_collapsed += 1;
+            rows_collapsed += omitted;
+            for line in &lines[i + 1..end - 1] {
+                tokens_saved += (line.len() as u32).div_ceil(4);
+            }
+            i = end;
+        } else {
+            output.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+
+    let trailing_newline = text.ends_with('\n');
+    let mut result = output.join("\n");
+    if trailing_newline && !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    Ok(IndexedRowResult {
+        text: result,
+        runs_collapsed,
+        rows_collapsed,
+        tokens_saved,
+    })
+}
+
+const INDEXED_SIGNAL_WORDS: [&str; 12] = [
+    "error",
+    "warning",
+    "fatal",
+    "panic",
+    "exception",
+    "failed",
+    "failure",
+    "assert",
+    "traceback",
+    "backtrace",
+    "stack trace",
+    "<<<",
+
+];
+
+fn is_signal_row(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    INDEXED_SIGNAL_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// Trailing run of ASCII digits in `token` (empty when it has none).
+fn trailing_digits(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    let mut start = bytes.len();
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    &token[start..]
+}
+
+/// The part of `token` before its trailing digit run, and that digit run.
+fn split_trailing_digits(token: &str) -> (&str, &str) {
+    let digits = trailing_digits(token);
+    (&token[..token.len() - digits.len()], digits)
+}
+
+/// Whether two rows differ only in an index or name field.
+fn compatible_rows(a: &str, b: &str) -> bool {
+    let left: Vec<&str> = a.split_whitespace().collect();
+    let right: Vec<&str> = b.split_whitespace().collect();
+    if left.len() != right.len() || left.is_empty() {
+        return false;
+    }
+    let differing: Vec<usize> = (0..left.len()).filter(|&k| left[k] != right[k]).collect();
+    if differing.is_empty() || differing.len() > 2 {
+        return false;
+    }
+    if differing.len() == 1 {
+        let k = differing[0];
+        if !left[k].chars().any(|c| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    for &k in &differing {
+        let barred = |token: &str| token.contains('/') || token.contains('=') || token.contains('|');
+        if barred(left[k]) || barred(right[k]) {
+            return false;
+        }
+    }
+    if differing.len() == 2 {
+        for &k in &differing {
+            let (left_prefix, left_digits) = split_trailing_digits(left[k]);
+            let (right_prefix, right_digits) = split_trailing_digits(right[k]);
+            if left_digits.is_empty()
+                || right_digits.is_empty()
+                || left_prefix != right_prefix
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `(field label, first row's value, second row's value)` for the first
+/// differing token of two rows.
+fn row_difference(a: &str, b: &str) -> (String, String, String) {
+    let left: Vec<&str> = a.split_whitespace().collect();
+    let right: Vec<&str> = b.split_whitespace().collect();
+    match (0..left.len().min(right.len())).find(|&k| left[k] != right[k]) {
+        Some(k) => (
+            format!("field {}", k + 1),
+            left[k].to_string(),
+            right[k].to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    }
+}
+
+/// How many distinct values the varying field takes across a run.
+fn distinct_varying_values(rows: &[&str]) -> usize {
+    let mut seen: Vec<String> = Vec::new();
+    for pair in rows.windows(2) {
+        let (_, first, second) = row_difference(pair[0], pair[1]);
+        for value in [first, second] {
+            if !value.is_empty() && !seen.iter().any(|known| known == &value) {
+                seen.push(value);
+            }
+        }
+    }
+    seen.len()
+}
+
 // ── Sliding Window Dedup ──────────────────────────────────────────────────────
 
 /// Token-level sliding window deduplication.
@@ -306,7 +523,203 @@ pub struct SlidingWindowResult {
     pub tokens_saved: u32,
 }
 
+// ── Identical-change diff folding ────────────────────────────────────────────
+
+/// Result of cross-file diff folding.
+#[derive(Debug, Clone)]
+pub struct DiffFoldResult {
+    pub text: String,
+    /// Files whose body was replaced by a reference line (the exemplar stays).
+    pub files_folded: usize,
+    /// Payload lines removed across those files.
+    pub payload_lines_folded: usize,
+    pub tokens_saved: u32,
+}
+
+/// Fold a git diff in which many files carry the same change.
+///
+/// A mechanical refactor shows up as sixty files with one identical hunk each;
+/// every byte of the payload is repeated, and the only per-file information the
+/// reader needs is where the change landed. This stage keeps the first file
+/// verbatim as the exemplar, then replaces each other file in the group with a
+/// single reference line carrying its path and its `@@` headers.
+///
+/// Safety rules, all required:
+/// - Only a buffer of `diff --git` sections is touched.
+/// - A body is only folded when it is byte-identical to the exemplar's body
+///   (digits included), so no digit is ever masked or inferred.
+/// - The body must be at least `min_payload_lines` lines, so one-line changes
+///   across files are not re-laid-out for nothing.
+/// - The declaration line states how many files were folded and that the body
+///   is shown once.
+/// - Every file path and every `@@` header survives verbatim.
+pub fn collapse_identical_diff_files(
+    text: &str,
+    min_files: usize,
+    min_payload_lines: usize,
+) -> Result<Option<DiffFoldResult>> {
+    let min_files = min_files.max(2);
+    if !text.contains("diff --git ") {
+        return Ok(None);
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("diff --git ") {
+            starts.push(i);
+        }
+    }
+    if starts.len() < min_files {
+        return Ok(None);
+    }
+
+    struct Section<'a> {
+        start: usize,
+        end: usize,
+        path: String,
+        body: Vec<&'a str>,
+        hunks: Vec<&'a str>,
+        unsafe_metadata: bool,
+    }
+
+    let mut sections: Vec<Section> = Vec::with_capacity(starts.len());
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+        let expanded = lines[start..end].join("\n");
+        let path = diff_section_path(&expanded).unwrap_or_else(|| format!("file{}", n));
+        let mut body: Vec<&str> = Vec::new();
+        let mut hunks: Vec<&str> = Vec::new();
+        let mut unsafe_metadata = false;
+        for line in &lines[start..end] {
+            if line.starts_with("@@") {
+                hunks.push(line);
+            } else if is_diff_payload_line(line) {
+                body.push(line);
+            } else if !is_plain_diff_metadata(line) {
+                // Mode changes, renames, copies, and binary patches carry
+                // information that is not in the payload. Folding the section
+                // would drop it, so a group with any such line stays verbatim.
+                unsafe_metadata = true;
+            }
+        }
+        sections.push(Section { start, end, path, body, hunks, unsafe_metadata });
+    }
+
+    // Group section indices by body text, preserving first-appearance order.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (idx, section) in sections.iter().enumerate() {
+        if section.body.len() < min_payload_lines || section.hunks.is_empty() {
+            continue;
+        }
+        if section.unsafe_metadata {
+            continue;
+        }
+        let key = section.body.join("\n");
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(idx),
+            None => groups.push((key, vec![idx])),
+        }
+    }
+
+    let mut folded: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut folded_groups: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (_key, members) in &groups {
+        if members.len() < min_files {
+            continue;
+        }
+        let exemplar = members[0];
+        for &member in &members[1..] {
+            folded.insert(member, exemplar);
+        }
+        folded_groups.insert(exemplar, members.len());
+    }
+
+    if folded.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut files_folded = 0usize;
+    let mut payload_lines_folded = 0usize;
+    for (idx, section) in sections.iter().enumerate() {
+        // Text before the first `diff --git` line is preserved by the caller
+        // path only; sections cover the whole buffer here.
+        if idx == 0 && section.start > 0 {
+            out.extend(lines[..section.start].iter().map(|l| (*l).to_string()));
+        }
+        if folded.contains_key(&idx) {
+            // Both diff path forms (`a/x`, `b/x`) stay so a reader (or a
+            // verification pass) still sees the file as the diff header names
+            // it, and every hunk header is preserved verbatim.
+            out.push(format!(
+                "  a/{} b/{} {}",
+                section.path,
+                section.path,
+                section.hunks.join(" ")
+            ));
+            files_folded += 1;
+            payload_lines_folded += section.body.len();
+            continue;
+        }
+        if let Some(&group) = folded_groups.get(&idx) {
+            out.push(format!(
+                "[identical change: body shown once, {group} files carry it; the rest are \
+                 listed as path + hunk header]"
+            ));
+        }
+        out.extend(lines[section.start..section.end].iter().map(|l| (*l).to_string()));
+    }
+
+    let mut text_out = out.join("\n");
+    if text.ends_with('\n') {
+        text_out.push('\n');
+    }
+    let tokens_saved = ((text.len().saturating_sub(text_out.len())) / 4) as u32;
+    Ok(Some(DiffFoldResult {
+        text: text_out,
+        files_folded,
+        payload_lines_folded,
+        tokens_saved,
+    }))
+}
+
+/// `b/<path>` from a `diff --git a/<path> b/<path>` line.
+fn diff_section_path(section: &str) -> Option<String> {
+    let first = section.lines().next()?;
+    let rest = first.strip_prefix("diff --git ")?;
+    let after_b = rest.rsplit(" b/").next()?;
+    if after_b.is_empty() || after_b == rest {
+        return None;
+    }
+    Some(after_b.to_string())
+}
+
+/// Whether a line belongs to a hunk body rather than to file metadata.
+fn is_diff_payload_line(line: &str) -> bool {
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        return false;
+    }
+    line.starts_with(' ')
+        || line.starts_with('+')
+        || line.starts_with('-')
+        || line.starts_with("\\ ")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Whether a metadata line is one folding may drop without losing meaning.
+///
+/// `diff --git`, `index`, and the `---`/`+++` file markers only name the file,
+/// which the reference line already carries. Anything else (mode changes,
+/// renames, copies, binary patches) changes what the patch does.
+fn is_plain_diff_metadata(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.trim().is_empty()
+}
 
 #[cfg(test)]
 mod tests {
@@ -375,7 +788,56 @@ done\n";
         assert_eq!(result.text, input);
     }
 
-    // --- RLE tests ---
+    #[test]
+    fn test_indexed_row_collapse_basic() {
+        let mut input = String::new();
+        for i in 1..=300 {
+            input.push_str(&format!("test case {i} ... ok\n"));
+        }
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 298);
+        assert!(result.text.contains("[×298 rows omitted: field 3 spans \"1\" .. \"300\", all other fields identical]"));
+    }
+
+    #[test]
+    fn test_indexed_row_signal_words_break_runs() {
+        let input = "\
+        test case 1 ... ok
+        test case 2 ... ok
+        error: something failed
+        test case 3 ... ok
+        test case 4 ... ok
+        <<< signal
+        test case 5 ... ok
+        test case 6 ... ok
+        test case 7 ... ok
+        test case 8 ... ok\n";
+        let result = collapse_indexed_rows(&input, 3).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert!(result.text.contains("error: something failed"));
+        assert!(result.text.contains("<<< signal"));
+    }
+
+    #[test]
+    fn test_indexed_row_min_length() {
+        let input = "a 1\na 2\na 3\n";
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn test_indexed_row_aligned_two_token_collapse() {
+        let mut input = String::new();
+        for i in 1..=10 {
+            input.push_str(&format!("ALTER TABLE t_{i} ADD COLUMN col_{i} TEXT\n"));
+        }
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert!(result.text.contains("[×8 rows omitted"));
+    }
+
 
     #[test]
     fn test_rle_no_repetition() {
@@ -502,6 +964,213 @@ done\n";
     fn test_sliding_window_empty_input() {
         let result = sliding_window_dedup("", 3).unwrap();
         assert_eq!(result.text, "");
+    }
+
+    // ── indexed-row compaction ────────────────────────────────────────
+
+    fn cargo_rows(count: usize) -> String {
+        (0..count)
+            .map(|n| format!("test tests::case_{n} ... ok\n"))
+            .collect()
+    }
+
+    #[test]
+    fn indexed_rows_collapse_a_passing_test_run() {
+        let input = cargo_rows(300);
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 298);
+        assert_eq!(result.text.lines().count(), 3, "first row, marker, last row");
+        assert!(result.text.contains("test tests::case_0 ... ok"));
+        assert!(result.text.contains("test tests::case_299 ... ok"));
+        assert!(
+            result.text.contains("[×298 rows omitted: field 2 spans \"tests::case_0\" .. \"tests::case_299\""),
+            "marker declares the loss and the varying field: {}",
+            result.text
+        );
+        assert!(!result.text.contains("case_150"));
+    }
+
+    #[test]
+    fn indexed_rows_never_swallow_a_failing_row() {
+        let mut input = cargo_rows(300);
+        input = input.replace(
+            "test tests::case_150 ... ok\n",
+            "test tests::case_150 ... FAILED\n",
+        );
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert!(
+            result.text.contains("test tests::case_150 ... FAILED"),
+            "failing row must survive verbatim: {}",
+            result.text
+        );
+        // The run is split around the failure, so nothing between the two halves
+        // is dropped across it.
+        for n in [149usize, 151] {
+            assert!(
+                result.text.contains(&format!("case_{n}")),
+                "row {} sits at the run edge and must survive",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_rows_break_a_run_at_an_error_line() {
+        let input = "\
+report_0 written
+report_1 written
+report_2 written
+report_3 written
+error: shard 4 is unavailable
+report_5 written
+report_6 written
+report_7 written
+report_8 written
+";
+        let result = collapse_indexed_rows(input, 3).unwrap();
+        assert!(
+            result.text.contains("error: shard 4 is unavailable"),
+            "a signal line is never folded into a range: {}",
+            result.text
+        );
+        assert_eq!(result.runs_collapsed, 2, "the run splits around the error");
+        assert!(!result.text.contains("report_2"), "inner rows still collapse");
+    }
+
+    #[test]
+    fn indexed_rows_leave_short_runs_alone() {
+        let input = cargo_rows(3);
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn indexed_rows_leave_multi_field_changes_alone() {
+        let input = "\
+node_0 has alpha beta gamma
+node_1 has delta epsilon zeta
+node_2 has eta theta iota
+node_3 has kappa lambda mu
+";
+        let result = collapse_indexed_rows(input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0, "four varying fields are content");
+        assert_eq!(result.text, input);
+    }
+
+    #[test]
+    fn indexed_rows_collapse_aligned_double_index_rows() {
+        let input: String = (0..40)
+            .map(|n| format!("ALTER TABLE t_{n} ADD COLUMN col_{n} TEXT;\n"))
+            .collect();
+        let result = collapse_indexed_rows(&input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 1);
+        assert_eq!(result.rows_collapsed, 38);
+        assert!(result.text.contains("ALTER TABLE t_0 ADD COLUMN col_0 TEXT;"));
+        assert!(result.text.contains("ALTER TABLE t_39 ADD COLUMN col_39 TEXT;"));
+    }
+
+    #[test]
+    fn indexed_rows_never_touch_diff_payload() {
+        let input = "\
+diff --git a/src/mod_0.rs b/src/mod_0.rs\nindex 0000000..1111111 100644\n@@ -0,7 +0,9 @@\n";
+        let result = collapse_indexed_rows(input, 4).unwrap();
+        assert_eq!(result.runs_collapsed, 0);
+        assert_eq!(result.text, input);
+    }
+
+    // ── identical-change diff folding ─────────────────────────────────
+
+    fn repeated_diff(files: usize) -> String {
+        let mut out = String::new();
+        for i in 0..files {
+            out.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,4 +{i}0,6 @@ impl Mod{i} {{\n\
+                 -    let x = compute();\n\
+                 +    let mut x = compute().unwrap_or(0);\n\
+                 +    log::trace!(\"x={{x}}\");\n\
+                 -    return x;\n\
+                 +    x\n"
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn diff_folding_keeps_paths_and_hunk_headers() {
+        let input = repeated_diff(6);
+        let result = collapse_identical_diff_files(&input, 3, 4)
+            .unwrap()
+            .expect("identical bodies must fold");
+        assert_eq!(result.files_folded, 5);
+        for i in 0..6 {
+            assert!(
+                result.text.contains(&format!("src/mod_{i}.rs")),
+                "lost path mod_{i}: {}",
+                result.text
+            );
+            assert!(
+                result.text.contains(&format!("@@ -{i}0,4 +{i}0,6 @@ impl Mod{i} {{")),
+                "lost hunk header {i}: {}",
+                result.text
+            );
+        }
+        // The body appears once, with its real digits.
+        assert_eq!(result.text.matches("let mut x = compute().unwrap_or(0);").count(), 1);
+        assert!(result.text.contains("6 files carry it"));
+        assert!(result.text.len() < input.len());
+    }
+
+    #[test]
+    fn diff_folding_needs_identical_bodies() {
+        // Make one body differ by a single digit: numbers are never masked.
+        let input = repeated_diff(3).replacen("unwrap_or(0)", "unwrap_or(7)", 1);
+        let result = collapse_identical_diff_files(&input, 3, 4).unwrap();
+        assert!(result.is_none(), "folded files whose bodies differ");
+    }
+
+    #[test]
+    fn diff_folding_skips_small_groups_and_short_bodies() {
+        let two_files = repeated_diff(2);
+        assert!(collapse_identical_diff_files(&two_files, 3, 4).unwrap().is_none());
+        let long_bodies = repeated_diff(4);
+        assert!(
+            collapse_identical_diff_files(&long_bodies, 3, 99).unwrap().is_none(),
+            "payload shorter than the minimum must not fold"
+        );
+    }
+
+    #[test]
+    fn diff_folding_ignores_non_diff_text() {
+        let log = "line one\nline two\nline three\n";
+        assert!(collapse_identical_diff_files(log, 3, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn diff_folding_refuses_sections_with_mode_or_rename_metadata() {
+        // A mode change or a rename is not part of the payload, so folding the
+        // section would silently drop it. Those groups stay verbatim.
+        let input = repeated_diff(4).replacen(
+            "index abc1..def1 100644",
+            "old mode 100644\nnew mode 100755",
+            1,
+        );
+        let result = collapse_identical_diff_files(&input, 3, 4)
+            .unwrap()
+            .expect("the clean sections still fold");
+        assert!(
+            result.text.contains("new mode 100755"),
+            "mode change lost: {}",
+            result.text
+        );
+        // Three clean files folded (one exemplar, two references); the section
+        // with metadata is untouched.
+        assert_eq!(result.files_folded, 2);
     }
 
     use proptest::prelude::*;

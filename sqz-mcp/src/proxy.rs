@@ -270,7 +270,7 @@ impl ProxyState {
         let _ = self.engine.session_store().log_compression_with_project(
             c.tokens_original,
             c.tokens_compressed,
-            &[],
+            &c.stages,
             &format!("mcp-proxy:{tool_name}"),
             None,
         );

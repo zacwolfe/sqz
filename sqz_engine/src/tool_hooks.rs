@@ -221,6 +221,21 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
         return Ok(passthrough(platform, input));
     }
 
+    // Coverage visibility (issue: no data existed on what fraction of real
+    // Bash calls actually get intercepted vs. silently skipped). Off by
+    // default — set `SQZ_HOOK_DEBUG=1` to print one skip/hit line per
+    // invocation to the hook process's own stderr, which Claude Code does
+    // not feed back into the agent's context (unlike the compressed
+    // command's own stderr, which is deliberately merged via `2>&1`).
+    let hook_debug = std::env::var("SQZ_HOOK_DEBUG").is_ok();
+    macro_rules! log_skip {
+        ($reason:expr) => {
+            if hook_debug {
+                eprintln!("[sqz hook] skip ({}): {command}", $reason);
+            }
+        };
+    }
+
     // Don't intercept commands that are already piped through sqz.
     // Check the base command name specifically, not substring — so
     // "grep sqz logfile" or "cargo search sqz" aren't skipped.
@@ -238,12 +253,14 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
         || command.contains("sqz compress --cmd ")
         || command.contains("sqz.exe compress --cmd ")
     {
+        log_skip!("already-wrapped");
         return Ok(passthrough(platform, input));
     }
 
     // A background call streams its output to the agent while it runs;
     // through sqz nothing would show until the command exits.
     if runs_in_background(&parsed) {
+        log_skip!("background");
         return Ok(passthrough(platform, input));
     }
 
@@ -256,25 +273,39 @@ fn process_hook_for_platform(input: &str, platform: HookPlatform) -> Result<Stri
     // command name and raise `CommandNotFoundException`. `--cmd NAME`
     // is a normal CLI argument and all three shells parse it fine.
     let is_powershell = matches!(tool_name, "PowerShell" | "powershell" | "pwsh");
-    let rewritten = if platform == HookPlatform::ClaudeCode {
+    let (rewritten, how) = if platform == HookPlatform::ClaudeCode {
         let settings = claude_settings_files(&parsed);
         let shell = crate::shell_scan::Shell::from_env();
         match claude_rewrite(&parsed, command, is_powershell, &settings, shell) {
-            Some(rewritten) => rewritten,
-            None => return Ok(passthrough(platform, input)),
+            Some(rewritten) => (rewritten, "claude"),
+            None => {
+                log_skip!("claude-rewrite");
+                return Ok(passthrough(platform, input));
+            }
         }
     } else if is_powershell {
         // PowerShell pipes objects, so only plain commands are rewritten.
         if is_interactive_command(command) || has_shell_operators(command) {
+            log_skip!("powershell-interactive-or-compound");
             return Ok(passthrough(platform, input));
         }
-        crate::exit_marker::powershell_rewrite(command, &shell_escape(command))
+        (
+            crate::exit_marker::powershell_rewrite(command, &shell_escape(command)),
+            "powershell",
+        )
     } else {
         match crate::shell_scan::plan(command) {
-            Ok(plan) => posix_rewrite_plan(&plan),
-            Err(_) => return Ok(passthrough(platform, input)),
+            Ok(plan) => (posix_rewrite_plan(&plan), "posix"),
+            Err(reason) => {
+                log_skip!(format!("shell-scan: {reason:?}"));
+                return Ok(passthrough(platform, input));
+            }
         }
     };
+
+    if hook_debug {
+        eprintln!("[sqz hook] intercept ({how}): {command}");
+    }
 
     // Claude Code's updatedInput and Gemini's tool_input both REPLACE the
     // arguments, so unchanged fields like run_in_background, timeout,
@@ -2623,6 +2654,11 @@ fn list_label(body: &str) -> String {
 /// Check if a command contains shell operators that would break piping.
 /// Commands with these operators are passed through uncompressed rather
 /// than risk incorrect behavior.
+///
+/// Used by the OpenCode hook path (`process_opencode_hook`), which does a
+/// flat rewrite with no grouping, and by the PowerShell path. The POSIX
+/// Claude Code / Cursor / Windsurf / Gemini path parses the command with
+/// `shell_scan::plan` instead, so compound commands and pipes still compress.
 pub(crate) fn has_shell_operators(cmd: &str) -> bool {
     // Check for operators that would cause the pipe to only capture
     // the last command in a chain
@@ -3112,6 +3148,120 @@ mod tests {
         let input = r#"{"tool_name":"Bash","tool_input":{"command":"npm run dev --watch"}}"#;
         let result = process_hook(input).unwrap();
         assert_eq!(result, input, "watch mode should pass through");
+    }
+
+    #[test]
+    fn test_process_hook_compresses_compound_command() {
+        // Previously skipped entirely; now each stage runs with pipefail so
+        // the chain's output and exit status both survive.
+        let input = r#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"cargo build && cargo test"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.starts_with("set -o pipefail; "),
+            "compound command should enable pipefail: {cmd}"
+        );
+        assert!(
+            cmd.contains("cargo build 2>&1 | sqz compress")
+                && cmd.contains("&& cargo test 2>&1 | sqz compress"),
+            "both stages of the compound command should be compressed: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_compresses_existing_pipe() {
+        let input = r#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"cat file.txt | grep foo"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("cat file.txt | grep foo") && cmd.contains("| sqz compress"),
+            "existing pipe should be compressed as a group: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_compresses_command_substitution() {
+        let input = r#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"echo \"today is $(date)\""}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("echo \"today is $(date)\"") && cmd.contains("| sqz compress"),
+            "command substitution should be compressed as a group: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_output_redirect() {
+        // No amount of subshell grouping recovers output already sent to a file.
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"echo hello > output.txt"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "explicit output redirect must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_heredoc() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"git commit -F- <<'EOF'\nfeat: subject\nEOF"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "heredoc must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_still_skips_background() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"long_task &"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "background command must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_allows_bare_input_redirect() {
+        // Bare `<` doesn't need grouping — `sort < file 2>&1 | sqz compress`
+        // already captures the right output, so this should NOT be skipped
+        // and should NOT be subshell-wrapped either.
+        let input = r#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"sort < file.txt"}}"#;
+        let result = process_hook(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cmd = parsed["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            cmd,
+            "set -o pipefail; sort < file.txt 2>&1 | sqz compress --cmd sort",
+            "bare input redirect should be compressed without subshell wrapping"
+        );
+    }
+
+    #[test]
+    fn test_process_hook_powershell_still_skips_compound() {
+        // PowerShell's `( ... )` grouping semantics for multi-statement
+        // chains are unverified, so compound PowerShell commands stay on
+        // the conservative skip-only path.
+        let input = r#"{"tool_name":"PowerShell","tool_input":{"command":"Get-Item a; Get-Item b"}}"#;
+        let result = process_hook(input).unwrap();
+        assert_eq!(result, input, "compound PowerShell commands must still pass through");
+    }
+
+    #[test]
+    fn test_process_hook_debug_flag_does_not_alter_stdout_json() {
+        // SQZ_HOOK_DEBUG only adds stderr logging; the returned JSON (what
+        // Claude Code parses from stdout) must be identical either way.
+        // Tests share process env, so serialize around the mutation.
+        let input = r#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"cargo build && cargo test"}}"#;
+        let baseline = process_hook(input).unwrap();
+
+        std::env::set_var("SQZ_HOOK_DEBUG", "1");
+        let with_debug = process_hook(input).unwrap();
+        std::env::remove_var("SQZ_HOOK_DEBUG");
+
+        assert_eq!(baseline, with_debug, "debug flag must not change the emitted JSON");
     }
 
     #[test]
@@ -4857,4 +5007,3 @@ mod ci_hook_tests {
         }
     }
 }
-

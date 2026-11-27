@@ -1136,7 +1136,7 @@ fn cmd_init(skip_confirm: bool, global: bool, only: Option<String>, skip: Option
     if let Err(e) = std::fs::create_dir_all(&preset_dir) {
         eprintln!("[sqz] ✗ warning: could not create preset dir {}: {e}", preset_dir.display());
     } else if !preset_path.exists() {
-        match std::fs::write(&preset_path, DEFAULT_PRESET_TOML) {
+        match std::fs::write(&preset_path, sqz_engine::default_preset_toml()) {
             Ok(()) => println!("[sqz] ✓ default preset written to {}", preset_path.display()),
             Err(e) => eprintln!("[sqz] ✗ warning: could not write preset: {e}"),
         }
@@ -2812,6 +2812,11 @@ fn cmd_stats(session_id: Option<String>, project: Option<String>, breakdown: boo
         let cache_size: u64 = cache_entries.iter().map(|(_, sz)| sz).sum();
 
         let regret = engine.session_store().regret_stats().unwrap_or_default();
+        let stages = if let Some(ref dir) = project_dir {
+            engine.session_store().stage_breakdown_for_project(dir).unwrap_or_default()
+        } else {
+            engine.session_store().stage_breakdown().unwrap_or_default()
+        };
         let mut obj = serde_json::json!({
             "totalCompressions": cs.total_compressions,
             "tokensIn": cs.total_tokens_in,
@@ -2822,6 +2827,18 @@ fn cmd_stats(session_id: Option<String>, project: Option<String>, breakdown: boo
             "cacheSize": cache_size,
             "regretReruns": regret.reruns,
             "regretExpands": regret.expands,
+            "stages": stages
+                .iter()
+                .map(|(stage, tin, tout, count)| serde_json::json!({
+                    "stage": stage,
+                    "rows": count,
+                    "tokensIn": tin,
+                    "tokensOut": tout,
+                    "tokensSaved": tin.saturating_sub(*tout),
+                }))
+                .collect::<Vec<_>>(),
+            "stageNote": "A row is credited in full to every stage it ran; \
+                          per-stage token totals overlap and must NOT be summed.",
         });
         if let Some(ref a) = cost_opts {
             let est = sqz_engine::estimate_saved_cost(cs.tokens_saved(), a);
@@ -3069,6 +3086,64 @@ fn cmd_stats(session_id: Option<String>, project: Option<String>, breakdown: boo
             }
             println!("  {}", colors::dim(&"─".repeat(70)));
         }
+    }
+
+    // Per-stage attribution (from stages_applied). Shown whenever at
+    // least one row recorded a stage; older rows predate attribution.
+    // One row is credited in full to every stage it ran, so these token
+    // totals overlap and must not be summed.
+    let stage_rows = if let Some(ref dir) = project_dir {
+        engine.session_store().stage_breakdown_for_project(dir).unwrap_or_default()
+    } else {
+        engine.session_store().stage_breakdown().unwrap_or_default()
+    };
+    if !stage_rows.is_empty() {
+        println!();
+        println!("  {}", colors::bold(&colors::cyan("🧩 Stage Attribution")));
+        println!("  {}", colors::dim(&"─".repeat(70)));
+        println!(
+            "  {:<20} {:>6} {:>10} {:>10} {:>7}",
+            "stage", "rows", "tokens in", "out", "saved"
+        );
+        println!("  {}", colors::dim(&"─".repeat(70)));
+        for (stage, tin, tout, cnt) in &stage_rows {
+            let pct = if *tin > 0 {
+                ((tin - tout) as f64 / *tin as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let pct_str = format!("{pct}%");
+            let pct_colored = if pct > 70 {
+                colors::bright_green(&pct_str)
+            } else if pct > 30 {
+                colors::green(&pct_str)
+            } else if pct > 0 {
+                colors::yellow(&pct_str)
+            } else {
+                colors::dim(&pct_str)
+            };
+            let stage_display = if stage.chars().count() > 18 {
+                let cut: String = stage.chars().take(17).collect();
+                format!("{cut}…")
+            } else {
+                stage.clone()
+            };
+            let pad_needed = 20usize.saturating_sub(stage_display.len());
+            let padded = format!("{}{}", colors::magenta(&stage_display), " ".repeat(pad_needed));
+            println!(
+                "  {} {:>6} {:>10} {:>10} {:>7}",
+                padded, cnt, tin, tout, pct_colored,
+            );
+        }
+        println!("  {}", colors::dim(&"─".repeat(70)));
+        println!(
+            "  {}",
+            colors::dim("A row is credited in full to every stage it ran: stage token")
+        );
+        println!(
+            "  {}",
+            colors::dim("totals overlap and must NOT be summed.")
+        );
     }
 
     println!();
@@ -3919,29 +3994,3 @@ fn install_completions(hook: &ShellHook) {
         Err(_) => {} // silently skip — completions are optional
     }
 }
-
-const DEFAULT_PRESET_TOML: &str = r#"[meta]
-name = "default"
-version = "1"
-description = "Default sqz preset"
-
-[compression]
-keep_fields.enabled = false
-strip_fields.enabled = false
-condense.enabled = true
-strip_nulls.enabled = true
-flatten.enabled = false
-truncate_strings.enabled = false
-collapse_arrays.enabled = false
-custom_transforms.enabled = false
-
-[budget]
-window_size = 200000
-warning_threshold = 0.70
-ceiling_threshold = 0.85
-default_agent_budget = 50000
-
-[terse_mode]
-enabled = false
-level = "moderate"
-"#;

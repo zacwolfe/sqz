@@ -18,6 +18,7 @@ use crate::session_store::{SessionStore, SessionSummary};
 use crate::terse_mode::TerseMode;
 use crate::types::{CompressedContent, PinEntry, Provenance, SessionId};
 use crate::verifier::Verifier;
+use crate::size_cap;
 
 /// Top-level facade that wires all sqz_engine modules together.
 ///
@@ -66,27 +67,48 @@ impl SqzEngine {
     /// prefer absolute paths when hooks may run from subdirectories.
     /// Otherwise `~/.sqz/sessions.db`, falling back to a temp-file path
     /// if the home dir is unavailable.
+    ///
+    /// Under `cfg(test)` (unit tests in this crate) the home directory is
+    /// never used: a unique temp-file path is returned instead. Tests should
+    /// still prefer [`with_preset_and_store`](Self::with_preset_and_store)
+    /// with a `tempfile::TempDir`; this is a backstop so a stray
+    /// `SqzEngine::new()` can never append rows to a developer's real
+    /// `~/.sqz/sessions.db`.
     pub fn default_store_path() -> std::path::PathBuf {
         if let Some(custom) = Self::store_path_from_env(std::env::var("SQZ_DB_PATH").ok()) {
             return custom;
         }
-        if let Some(home) = dirs_next::home_dir() {
-            let sqz_dir = home.join(".sqz");
-            if std::fs::create_dir_all(&sqz_dir).is_ok() {
-                // Harden permissions on Unix: ~/.sqz/ contains session data
-                // and cached content that may include sensitive output.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &sqz_dir,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
-                }
-                return sqz_dir.join("sessions.db");
-            }
+        #[cfg(test)]
+        {
+            return Self::temp_store_path();
         }
-        // Fallback: temp dir with unique name
+        #[cfg(not(test))]
+        {
+            if let Some(home) = dirs_next::home_dir() {
+                let sqz_dir = home.join(".sqz");
+                if std::fs::create_dir_all(&sqz_dir).is_ok() {
+                    // Harden permissions on Unix: ~/.sqz/ contains session data
+                    // and cached content that may include sensitive output.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &sqz_dir,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    return sqz_dir.join("sessions.db");
+                }
+            }
+            Self::temp_store_path()
+        }
+    }
+
+    /// A unique, process-scoped temp-file store path.
+    ///
+    /// Used as the fallback when the home directory is unavailable, and as
+    /// the test-build default so unit tests never touch `~/.sqz`.
+    fn temp_store_path() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
         dir.join(format!(
             "sqz_session_{}_{}.db",
@@ -204,6 +226,10 @@ impl SqzEngine {
             .map_err(|_| SqzError::Other("preset lock poisoned".into()))?;
         let pipeline = self.pipeline.lock()
             .map_err(|_| SqzError::Other("pipeline lock poisoned".into()))?;
+        let max_tokens = preset
+            .compression
+            .max_output_tokens
+            .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
         let ctx = crate::pipeline::SessionContext {
             session_id: "engine".to_string(),
         };
@@ -218,7 +244,7 @@ impl SqzEngine {
             if std::env::var_os("SQZ_VERBOSE").is_some() {
                 eprintln!("[sqz] safe mode: high-risk content passed through unchanged");
             }
-            return self.compress_safe(input, &pipeline, &ctx, true);
+            return self.compress_safe(input, &pipeline, &ctx, true, max_tokens);
         }
 
         // Step 3: Compress with the configured pipeline
@@ -232,10 +258,20 @@ impl SqzEngine {
         // Step 5: If verifier signals low confidence, re-compress with safe settings
         if fallback && result.data != input {
             if !Self::quiet_stderr() {
-                eprintln!("[sqz] fallback: verifier confidence {:.2} below threshold — re-compressing in safe mode",
-                    result.verify.as_ref().map(|v| v.confidence).unwrap_or(0.0));
+                let failed = result
+                    .verify
+                    .as_ref()
+                    .map(|v| {
+                        v.checks_failed
+                            .iter()
+                            .map(|(check, _)| check.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                eprintln!("[sqz] fallback: verifier rejected [{failed}] - re-compressing in safe mode");
             }
-            let safe_result = self.compress_safe(input, &pipeline, &ctx, false)?;
+            let safe_result = self.compress_safe(input, &pipeline, &ctx, false, max_tokens)?;
             return Ok(safe_result);
         }
 
@@ -328,10 +364,15 @@ impl SqzEngine {
             self.compress(text).ok().map(|output| CacheResult::Fresh { output })
         }?;
 
-        let (out, tokens_compressed, repeat) = match result {
-            CacheResult::Dedup { inline_ref, token_cost } => (inline_ref, token_cost, true),
-            CacheResult::Delta { delta_text, token_cost, .. } => (delta_text, token_cost, true),
+        let (out, tokens_compressed, repeat, stages) = match result {
+            CacheResult::Dedup { inline_ref, token_cost } => {
+                (inline_ref, token_cost, true, vec!["dedup".to_string()])
+            }
+            CacheResult::Delta { delta_text, token_cost, .. } => {
+                (delta_text, token_cost, true, vec!["delta".to_string()])
+            }
             CacheResult::Fresh { output } => {
+                let stages = output.stages_applied;
                 // First pass is lossy, so point at the cached original.
                 let mut data = output.data;
                 if use_cache {
@@ -342,7 +383,7 @@ impl SqzEngine {
                     ));
                 }
                 let t = chars_over_four(&data);
-                (data, t, false)
+                (data, t, false, stages)
             }
         };
         if tokens_original.saturating_sub(tokens_compressed) < TOOL_RESULT_MIN_SAVING {
@@ -353,6 +394,7 @@ impl SqzEngine {
             tokens_original,
             tokens_compressed,
             repeat,
+            stages,
         })
     }
 
@@ -385,8 +427,15 @@ impl SqzEngine {
     ///
     /// - `CompressionMode::Safe` → safe pipeline only (ANSI strip + condense)
     /// - `CompressionMode::Default` → standard pipeline
-    /// - `CompressionMode::Aggressive` → standard pipeline (aggressive preset TBD)
+    /// - `CompressionMode::Aggressive` → aggressive preset, verified, with a safe-mode fallback
     pub fn compress_with_mode(&self, input: &str, mode: crate::confidence_router::CompressionMode) -> Result<CompressedContent> {
+        // Same lock order as `compress` (preset before pipeline): taking them
+        // in the other order deadlocks against a concurrent `compress` call.
+        let max_tokens = self
+            .preset
+            .lock()
+            .map(|p| p.compression.max_output_tokens.unwrap_or(size_cap::DEFAULT_MAX_TOKENS))
+            .unwrap_or(size_cap::DEFAULT_MAX_TOKENS);
         let pipeline = self.pipeline.lock()
             .map_err(|_| SqzError::Other("pipeline lock poisoned".into()))?;
         let ctx = crate::pipeline::SessionContext {
@@ -397,10 +446,43 @@ impl SqzEngine {
             crate::confidence_router::CompressionMode::Safe => {
                 let lossless = self.confidence_router.route(input)
                     == crate::confidence_router::CompressionMode::Safe;
-                self.compress_safe(input, &pipeline, &ctx, lossless)
+                self.compress_safe(input, &pipeline, &ctx, lossless, max_tokens)
+            }
+            crate::confidence_router::CompressionMode::Aggressive => {
+                // High-risk content (secrets, migrations, panic backtraces)
+                // must never be truncated, even in aggressive mode.
+                if self.confidence_router.route(input)
+                    == crate::confidence_router::CompressionMode::Safe
+                {
+                    return self.compress_safe(input, &pipeline, &ctx, true, max_tokens);
+                }
+                let current_preset = self
+                    .preset
+                    .lock()
+                    .map_err(|_| SqzError::Other("preset lock poisoned".into()))?;
+                let aggressive = crate::preset::aggressive_preset(&current_preset);
+                drop(current_preset);
+                let mut result = pipeline.compress(input, &ctx, &aggressive)?;
+                let verify = Verifier::verify(input, &result.data);
+                if verify.fallback_triggered {
+                    if !Self::quiet_stderr() {
+                        let failed = verify
+                            .checks_failed
+                            .iter()
+                            .map(|(check, _)| check.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprintln!(
+                            "[sqz] fallback: verifier rejected aggressive [{failed}] - re-compressing in safe mode"
+                        );
+                    }
+                    return self.compress_safe(input, &pipeline, &ctx, false, max_tokens);
+                }
+                result.verify = Some(verify);
+                Ok(result)
             }
             _ => {
-                // Default and Aggressive: run normal pipeline + verify
+                // Default: run normal pipeline + verify
                 drop(pipeline); // release lock before calling compress()
                 self.compress(input)
             }
@@ -414,6 +496,7 @@ impl SqzEngine {
         pipeline: &crate::pipeline::CompressionPipeline,
         ctx: &crate::pipeline::SessionContext,
         lossless: bool,
+        max_tokens: u32,
     ) -> Result<CompressedContent> {
         use crate::preset::{
             CompressionConfig, CondenseConfig, CustomTransformsConfig, BudgetConfig,
@@ -437,6 +520,10 @@ impl SqzEngine {
                 truncate_strings: None,
                 collapse_arrays: None,
                 custom_transforms: Some(CustomTransformsConfig { enabled: false }),
+                json_projection: None,
+                entropy_threshold: None,
+                benign_entropy_threshold: None,
+                max_output_tokens: None,
             },
             tool_selection: ToolSelectionConfig {
                 max_tools: 5,
@@ -464,7 +551,28 @@ impl SqzEngine {
         } else {
             pipeline.compress(input, ctx, &safe_preset)?
         };
-        let verify = Verifier::verify(input, &result.data);
+        let mut verify = Verifier::verify(input, &result.data);
+        // A lossy "safe" retry that its own verifier rejects is not safe: it is
+        // the same data loss with a safer label. Fall back to the lossless path
+        // so the caller gets the bytes it passed in (modulo ANSI stripping)
+        // instead of a second unreliable compression.
+        if !lossless && verify.fallback_triggered {
+            result = pipeline.compress_lossless(input, ctx, &safe_preset)?;
+            verify = Verifier::verify(input, &result.data);
+        }
+        // The cap is a context-safety invariant, not a compression stage: a
+        // fallback that hands back the input verbatim must not smuggle a
+        // 165k-token dump past it.
+        // `pipeline` and the safe preset are already borrowed here, so count
+        // through them: `self.count_tokens` would re-lock the engine mutexes
+        // this call already holds.
+        if let Some(capped) = size_cap::cap_to_tokens(&result.data, max_tokens, |s| pipeline.count_tokens(s, &safe_preset)) {
+            result.data = capped;
+            if !result.stages_applied.iter().any(|s| s == "size_cap") {
+                result.stages_applied.push("size_cap".to_owned());
+            }
+        }
+        pipeline.count_output(&mut result, &safe_preset);
         result.verify = Some(verify);
         result.provenance = Provenance {
             label: Some("safe-fallback".to_string()),
@@ -654,6 +762,9 @@ pub struct ToolResultCompression {
     /// A ref or delta against content already sent: lossless. Otherwise a
     /// first-pass compression, which is lossy.
     pub repeat: bool,
+    /// Pipeline stages that produced the output (`["dedup"]`/`["delta"]`
+    /// for cache hits). Recorded in `compression_log.stages_applied`.
+    pub stages: Vec<String>,
 }
 
 fn chars_over_four(text: &str) -> u32 {
@@ -828,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_fallback_still_compresses() {
+    fn path_rows_survive_truncation_while_filler_is_dropped() {
         use crate::confidence_router::CompressionMode;
         let dir = tempfile::tempdir().unwrap();
         let engine = SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db")).unwrap();
@@ -844,9 +955,76 @@ mod tests {
             .join("\n\n");
         assert_ne!(engine.route_compression_mode(&input), CompressionMode::Safe);
         let result = engine.compress(&input).unwrap();
-        assert_eq!(result.provenance.label.as_deref(), Some("safe-fallback"));
+        // Byte-entropy ranking used to score the `llllllll` filler rows below
+        // the plain prose (filler repeats a single byte) and drop exactly the
+        // rows holding a file path. Identity-bearing segments now outrank
+        // filler, so the truncation removes prose and keeps every path.
+        for i in (0..24).step_by(2) {
+            assert!(
+                result.data.contains(&format!("/srv/app/mod_{i}.py")),
+                "dropped path row {i}: {}",
+                result.data
+            );
+        }
+        assert!(
+            !result.data.contains("quick brown fox"),
+            "filler survived instead of being truncated: {}",
+            result.data
+        );
         assert!(result.data.contains("low-information segments omitted"), "{}", result.data);
-        assert_eq!(result.data, engine.compress_with_mode(&input, CompressionMode::Safe).unwrap().data);
+        assert!(result.data.len() < input.len());
+        assert!(result.verify.as_ref().is_some_and(|v| v.passed));
+        assert_eq!(result.provenance.label.as_deref(), None);
+    }
+
+    #[test]
+    fn identical_hunks_across_files_fold_and_verify() {
+        use crate::confidence_router::CompressionMode;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db")).unwrap();
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!(
+                "diff --git a/src/mod_{i}.rs b/src/mod_{i}.rs\n\
+                 index abc{i}..def{i} 100644\n\
+                 --- a/src/mod_{i}.rs\n\
+                 +++ b/src/mod_{i}.rs\n\
+                 @@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{\n\
+                 -    let x_0 = compute(0);\n\
+                 +    let mut x_0 = compute(0).unwrap_or(0);\n\
+                 -    let x_1 = compute(1);\n\
+                 +    let mut x_1 = compute(1).unwrap_or(1);\n\
+                 -    let x_2 = compute(2);\n\
+                 +    let mut x_2 = compute(2).unwrap_or(2);\n"
+            ));
+        }
+        assert_ne!(engine.route_compression_mode(&input), CompressionMode::Safe);
+        let result = engine.compress(&input).unwrap();
+        // One exemplar body plus a path/hunk line per file. Before this stage
+        // the diff fell through to entropy truncation, which deleted whole
+        // files from the middle and kept the rest verbatim.
+        assert!(
+            result.stages_applied.iter().any(|s| s == "diff_fold"),
+            "diff_fold did not run: {:?}",
+            result.stages_applied
+        );
+        assert!(result.data.contains("identical change"), "{}", result.data);
+        for i in 0..40 {
+            assert!(
+                result.data.contains(&format!("a/src/mod_{i}.rs b/src/mod_{i}.rs")),
+                "lost file {i}: {}",
+                result.data
+            );
+            assert!(
+                result.data.contains(&format!("@@ -{i}0,7 +{i}0,9 @@ impl Mod{i} {{")),
+                "lost hunk header {i}: {}",
+                result.data
+            );
+        }
+        assert_eq!(result.data.matches("let mut x_0 = compute(0).unwrap_or(0);").count(), 1);
+        assert!(result.data.len() * 4 < input.len(), "fold was not honored");
+        assert!(result.verify.as_ref().is_some_and(|v| v.passed));
+        assert_eq!(result.provenance.label.as_deref(), None);
     }
 
     #[test]
@@ -1090,5 +1268,89 @@ complexity_threshold = 0.4
         assert!(db.exists(), "database file must land at the custom path");
         let stats = engine.session_store().compression_stats().unwrap();
         assert_eq!(stats.total_compressions, 1);
+    }
+
+    /// Regression: a safe-mode fallback that hits the size cap must report the
+    /// count of the bytes it actually emits, not the pre-cap count. Otherwise
+    /// oversized payloads log as zero-yield and `sqz stats` understates savings.
+    #[test]
+    fn safe_mode_recounts_tokens_after_fallback_cap() {
+        use crate::confidence_router::CompressionMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db"))
+                .unwrap();
+
+        // Unique per line *and* varying word count: `condense` only folds
+        // identical lines, `log_template` only folds digit-masked templates,
+        // and `collapse_indexed_rows` needs adjacent rows with the same token
+        // count, so this payload survives every stage and reaches the cap.
+        // ~130 KB is >4x DEFAULT_MAX_TOKENS yet cheap to tokenize in a debug build.
+        let payload = (0..4_000u32)
+            .map(|i| {
+                let pad = "filler ".repeat((i % 7) as usize);
+                format!("row {i:05} {pad}tail value {}\n", i.wrapping_mul(2_654_435_761))
+            })
+            .collect::<String>();
+        let result = engine
+            .compress_with_mode(&payload, CompressionMode::Safe)
+            .unwrap();
+
+        assert!(
+            result.tokens_compressed < result.tokens_original,
+            "compressed ({}) must be below original ({})",
+            result.tokens_compressed,
+            result.tokens_original
+        );
+        assert!(
+            result.stages_applied.iter().any(|s| s == "size_cap"),
+            "size_cap must be recorded, got {:?}",
+            result.stages_applied
+        );
+        assert!(
+            result.tokens_compressed <= crate::size_cap::DEFAULT_MAX_TOKENS + 512,
+            "compressed ({}) must respect the {} cap",
+            result.tokens_compressed,
+            crate::size_cap::DEFAULT_MAX_TOKENS
+        );
+        assert_eq!(
+            result.tokens_compressed,
+            engine.count_tokens(&result.data),
+            "logged tokens must equal the emitted bytes' count"
+        );
+    }
+
+    /// Regression: unit tests must never resolve the default store into the
+    /// developer's real `~/.sqz/sessions.db`. Historically property tests
+    /// called `SqzEngine::new()` and appended rows to the live stats DB,
+    /// polluting `sqz stats` with fixture output. Under `cfg(test)` the
+    /// default must be a temp path, and the previously leaking constructor
+    /// must still open it successfully.
+    #[test]
+    fn default_store_path_never_targets_real_home_under_test() {
+        if SqzEngine::store_path_from_env(std::env::var("SQZ_DB_PATH").ok()).is_some() {
+            // The caller pinned a DB explicitly; nothing to guard.
+            return;
+        }
+
+        let resolved = SqzEngine::default_store_path();
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "test-build default store must live under the temp dir, got {}",
+            resolved.display()
+        );
+        if let Some(home) = dirs_next::home_dir() {
+            assert!(
+                !resolved.starts_with(home.join(".sqz")),
+                "test-build default store must not live under {}, got {}",
+                home.display(),
+                resolved.display()
+            );
+        }
+
+        // The previously leaking constructor resolves through the same path.
+        let engine = SqzEngine::new().expect("engine init on the test default path");
+        drop(engine);
     }
 }
