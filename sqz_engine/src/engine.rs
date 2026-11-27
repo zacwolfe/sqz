@@ -572,6 +572,7 @@ impl SqzEngine {
                 result.stages_applied.push("size_cap".to_owned());
             }
         }
+        pipeline.count_output(&mut result, &safe_preset);
         result.verify = Some(verify);
         result.provenance = Provenance {
             label: Some("safe-fallback".to_string()),
@@ -1267,6 +1268,47 @@ complexity_threshold = 0.4
         assert!(db.exists(), "database file must land at the custom path");
         let stats = engine.session_store().compression_stats().unwrap();
         assert_eq!(stats.total_compressions, 1);
+    }
+
+    /// Regression: a safe-mode fallback that hits the size cap must report the
+    /// count of the bytes it actually emits, not the pre-cap count. Otherwise
+    /// oversized payloads log as zero-yield and `sqz stats` understates savings.
+    #[test]
+    fn safe_mode_recounts_tokens_after_fallback_cap() {
+        use crate::confidence_router::CompressionMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            SqzEngine::with_preset_and_store(Preset::default(), &dir.path().join("store.db"))
+                .unwrap();
+
+        let payload = "line of repetitive text 0123456789\n".repeat(200_000);
+        let result = engine
+            .compress_with_mode(&payload, CompressionMode::Safe)
+            .unwrap();
+
+        assert!(
+            result.tokens_compressed < result.tokens_original,
+            "compressed ({}) must be below original ({})",
+            result.tokens_compressed,
+            result.tokens_original
+        );
+        assert!(
+            result.stages_applied.iter().any(|s| s == "size_cap"),
+            "size_cap must be recorded, got {:?}",
+            result.stages_applied
+        );
+        assert!(
+            result.tokens_compressed <= crate::size_cap::DEFAULT_MAX_TOKENS + 512,
+            "compressed ({}) must respect the {} cap",
+            result.tokens_compressed,
+            crate::size_cap::DEFAULT_MAX_TOKENS
+        );
+        assert_eq!(
+            result.tokens_compressed,
+            engine.count_tokens(&result.data),
+            "logged tokens must equal the emitted bytes' count"
+        );
     }
 
     /// Regression: unit tests must never resolve the default store into the
